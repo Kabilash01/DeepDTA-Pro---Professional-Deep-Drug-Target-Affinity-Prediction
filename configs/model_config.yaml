@@ -1,0 +1,43 @@
+# Model Architecture Configuration
+model:
+  molecular_gnn:
+    node_features: 74
+    edge_features: 12
+    hidden_dim: 256
+    num_layers: 5
+    dropout: 0.1
+    activation: "relu"
+    pooling: "attention"
+    
+  protein_encoder:
+    vocab_size: 26  # 20 amino acids + special tokens
+    embed_dim: 512
+    num_layers: 6
+    num_heads: 8
+    dropout: 0.1
+    max_length: 2000
+    
+  fusion_network:
+    mol_dim: 256
+    prot_dim: 512
+    fusion_dim: 512
+    num_heads: 8
+    dropout: 0.1
+    
+  prediction_head:
+    input_dim: 256
+    hidden_dims: [128, 64]
+    dropout: 0.1
+    use_uncertainty: true
+
+# Loss function configuration
+loss:
+  type: "mse"  # mse, mae, huber
+  huber_delta: 1.0
+  uncertainty_weight: 0.1
+
+# Regularization
+regularization:
+  weight_decay: 1e-4
+  gradient_clipping: 1.0
+  label_smoothing: 0.0

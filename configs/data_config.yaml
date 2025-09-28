@@ -1,0 +1,92 @@
+# Data Processing Configuration
+data:
+  # Dataset paths
+  paths:
+    davis: "data/raw/davis"
+    kiba: "data/raw/kiba"
+    processed: "data/processed"
+    splits: "data/processed/splits"
+  
+  # Davis dataset processing
+  davis:
+    drugs_file: "drugs.csv"
+    proteins_file: "proteins.csv"
+    affinity_file: "drug_protein_affinity.csv"
+    affinity_column: "affinity"  # Column name for binding affinity
+    log_transform: true
+    
+  # KIBA dataset processing
+  kiba:
+    ligands_can_file: "ligands_can.txt"
+    ligands_iso_file: "ligands_iso.txt"
+    proteins_file: "proteins.txt"
+    proteins_csv_file: "proteins.csv"
+    affinity_matrix_file: "Y"
+    binding_file: "kiba_binding_affinity_v2.txt"
+    log_transform: false  # KIBA scores are already log-transformed
+  
+  # Molecular processing
+  molecular:
+    max_atoms: 100
+    include_hydrogens: false
+    sanitize: true
+    canonical_smiles: true
+    
+    # Atomic features
+    atom_features:
+      - "atomic_num"
+      - "formal_charge"
+      - "hybridization"
+      - "num_radical_electrons"
+      - "aromatic"
+      - "in_ring"
+      - "degree"
+      - "total_valence"
+    
+    # Bond features
+    bond_features:
+      - "bond_type"
+      - "stereo"
+      - "conjugated"
+      - "in_ring"
+  
+  # Protein processing
+  protein:
+    max_length: 2000
+    padding_token: 0
+    unknown_token: 1
+    amino_acid_vocab:
+      "A": 2, "C": 3, "D": 4, "E": 5, "F": 6, "G": 7, "H": 8, "I": 9,
+      "K": 10, "L": 11, "M": 12, "N": 13, "P": 14, "Q": 15, "R": 16,
+      "S": 17, "T": 18, "V": 19, "W": 20, "Y": 21, "X": 1  # X for unknown
+  
+  # Data splitting
+  splitting:
+    test_size: 0.2
+    val_size: 0.15
+    random_state: 42
+    stratify: false
+    
+    # Cross-validation
+    cv_folds: 5
+    cv_strategy: "random"  # random, scaffold, temporal
+  
+  # Data augmentation
+  augmentation:
+    enabled: false
+    molecular_augmentation:
+      - "random_smiles"  # Generate different SMILES for same molecule
+      - "noise_addition"  # Add small noise to coordinates
+    protein_augmentation:
+      - "random_masking"  # Randomly mask amino acids
+      - "subsequence"     # Use random subsequences
+
+# Quality control
+quality_control:
+  remove_duplicates: true
+  min_affinity_threshold: null  # Remove entries below threshold
+  max_affinity_threshold: null  # Remove entries above threshold
+  valid_smiles_only: true
+  valid_protein_only: true
+  min_protein_length: 50
+  max_protein_length: 2000
