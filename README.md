@@ -444,6 +444,6 @@ If you use DeepDTA-Pro in your research, please cite:
 
 **Built with ❤️ for the drug discovery community**
 
-[⭐ Star us on GitHub](https://github.com/your-username/deepdta-pro) | [📚 Read the Docs](https://deepdta-pro.readthedocs.io) | [💬 Join Discussions](https://github.com/your-username/deepdta-pro/discussions)
+[⭐ Star us on GitHub](https://github.com/Kabilash01/deepdta-pro) | [📚 Read the Docs](https://deepdta-pro.readthedocs.io) | [💬 Join Discussions](https://github.com/your-username/deepdta-pro/discussions)
 
 </div>
