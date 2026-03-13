@@ -405,10 +405,9 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ## 📞 Support & Contact
 
-- **Issues**: [GitHub Issues](https://github.com/your-username/deepdta-pro/issues)
-- **Discussions**: [GitHub Discussions](https://github.com/your-username/deepdta-pro/discussions)
-- **Email**: deepdta-pro@example.com
-- **Documentation**: [Read the Docs](https://deepdta-pro.readthedocs.io)
+- **Issues**: [GitHub Issues](https://github.com/Kabilash01/deepdta-pro/issues)
+- **Discussions**: [GitHub Discussions](https://github.com/Kabilash01/deepdta-pro/discussions)
+- **Email**: kabilash0108@gmail.com
 
 ## 🙏 Acknowledgments
 
@@ -434,9 +433,9 @@ If you use DeepDTA-Pro in your research, please cite:
 
 ## 🔄 Version History
 
-- **v1.0.0** (2024-01) - Initial release with complete functionality
-- **v0.9.0** (2023-12) - Beta release with web interface
-- **v0.8.0** (2023-11) - Alpha release with core features
+- **v1.0.0** (2026-01) - Initial release with complete functionality
+- **v0.9.0** (2025-12) - Beta release with web interface
+- **v0.8.0** (2025-11) - Alpha release with core features
 
 ---
 
