@@ -131,7 +131,8 @@ class DeepDTATrainer:
             def forward(self, x):
                 # Mock input processing
                 batch_size = len(x) if isinstance(x, list) else 32
-                mock_features = torch.randn(batch_size, 100)
+                device = next(self.fc.parameters()).device
+                mock_features = torch.randn(batch_size, 100, device=device)
                 return self.fc(mock_features)
                 
         return MockModel().to(self.device)
