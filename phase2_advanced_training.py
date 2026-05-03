@@ -13,6 +13,10 @@ import logging
 from pathlib import Path
 import time
 from tqdm import tqdm
+import sys
+
+sys.path.insert(0, str(Path(__file__).parent))
+from target_normalizer import AffinityNormalizer
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -134,10 +138,15 @@ class EnhancedModel(nn.Module):
 class Phase2Trainer:
     """Trainer for Phase 2 with enhanced features"""
 
-    def __init__(self, config: dict):
+    def __init__(self, config: dict, affinity_mean: float = 5.45, affinity_std: float = 0.90):
         self.config = config
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         logger.info(f"🖥️ Using device: {self.device}")
+
+        # Normalize targets
+        self.affinity_mean = affinity_mean
+        self.affinity_std = affinity_std
+        logger.info(f"📊 Target normalization: mean={affinity_mean:.4f}, std={affinity_std:.4f}")
 
         self.model = EnhancedModel(mol_dim=138, prot_dim=24, hidden_dim=256).to(self.device)
         logger.info(f"📊 Model parameters: {sum(p.numel() for p in self.model.parameters()):,}")
@@ -153,6 +162,14 @@ class Phase2Trainer:
         self.train_losses = []
         self.val_losses = []
         self.best_val_loss = float('inf')
+
+    def normalize_affinity(self, affinity):
+        """Normalize affinity to ~[0, 1] range"""
+        return (affinity - self.affinity_mean) / (self.affinity_std + 1e-8)
+
+    def denormalize_affinity(self, normalized):
+        """Denormalize affinity back to original scale"""
+        return normalized * self.affinity_std + self.affinity_mean
 
     def train_epoch(self, train_data, epoch, total_epochs):
         """Train one epoch"""
@@ -180,7 +197,8 @@ class Phase2Trainer:
 
                 mol_feats.append(mol_feat)
                 prot_feats.append(prot_feat)
-                targets.append(sample['affinity'])
+                # Normalize affinity
+                targets.append(self.normalize_affinity(sample['affinity']))
 
             # Convert to tensors
             mol_feats_t = torch.tensor(np.stack(mol_feats), dtype=torch.float32).to(self.device)
@@ -219,13 +237,16 @@ class Phase2Trainer:
 
                 mol_feat_t = torch.tensor(mol_feat, dtype=torch.float32).unsqueeze(0).to(self.device)
                 prot_feat_t = torch.tensor(prot_feat, dtype=torch.float32).unsqueeze(0).to(self.device)
-                target_t = torch.tensor([sample['affinity']], dtype=torch.float32).view(1, 1).to(self.device)
+                # Normalize target
+                normalized_target = self.normalize_affinity(sample['affinity'])
+                target_t = torch.tensor([normalized_target], dtype=torch.float32).view(1, 1).to(self.device)
 
                 pred = self.model(mol_feat_t, prot_feat_t)
                 loss = self.criterion(pred, target_t)
 
                 total_loss += loss.item()
-                predictions.append(pred.cpu().item())
+                # Denormalize for metrics
+                predictions.append(self.denormalize_affinity(pred.cpu().item()))
                 targets.append(sample['affinity'])
 
         avg_loss = total_loss / max(1, len(val_data))
@@ -294,26 +315,35 @@ def main():
     print("PHASE 2: ADVANCED TRAINING WITH ENHANCED FEATURES")
     print("=" * 70 + "\n")
 
-    # Create synthetic data
-    drug_templates = ["CC(C)CC1=CC=C(C=C1)C(C)C(=O)O", "CC(=O)OC1=CC=CC=C1C(=O)O"]
-    protein_templates = ["MKKFFDSRREQGGSGLGSGSSGGGGSGGGYGNQDQSGGGGSGGGYGNQDQ"]
+    # Load real DAVIS data
+    from phase3_real_data import load_real_dataset
+    train_data, val_data, test_data = load_real_dataset(source='davis')
 
-    np.random.seed(42)
-    dataset = []
-    for i in range(500):
-        dataset.append({
-            'drug_smiles': drug_templates[i % 2],
-            'protein_sequence': protein_templates[0] + "G" * (i % 10),
-            'affinity': np.random.uniform(1.0, 10.0)
-        })
-
-    # Split
-    n = len(dataset)
-    train_data = dataset[:int(0.7 * n)]
-    val_data = dataset[int(0.7 * n):int(0.85 * n)]
-    test_data = dataset[int(0.85 * n):]
+    if not train_data:
+        logger.error("Failed to load DAVIS dataset. Using smaller synthetic dataset.")
+        # Fallback to synthetic
+        drug_templates = ["CC(C)CC1=CC=C(C=C1)C(C)C(=O)O", "CC(=O)OC1=CC=CC=C1C(=O)O"]
+        protein_templates = ["MKKFFDSRREQGGSGLGSGSSGGGGSGGGYGNQDQSGGGGSGGGYGNQDQ"]
+        np.random.seed(42)
+        dataset = []
+        for i in range(500):
+            dataset.append({
+                'drug_smiles': drug_templates[i % 2],
+                'protein_sequence': protein_templates[0] + "G" * (i % 10),
+                'affinity': np.random.uniform(5.0, 10.0)
+            })
+        n = len(dataset)
+        train_data = dataset[:int(0.7 * n)]
+        val_data = dataset[int(0.7 * n):int(0.85 * n)]
+        test_data = dataset[int(0.85 * n):]
 
     logger.info(f"✅ Dataset: Train={len(train_data)}, Val={len(val_data)}, Test={len(test_data)}")
+
+    # Collect affinity stats for normalization
+    all_affinities = [s['affinity'] for s in train_data + val_data + test_data]
+    affinity_mean = np.mean(all_affinities)
+    affinity_std = np.std(all_affinities)
+    logger.info(f"📊 Affinity stats: mean={affinity_mean:.4f}, std={affinity_std:.4f}, range=[{min(all_affinities):.2f}-{max(all_affinities):.2f}]")
 
     # Config
     config = {
@@ -324,7 +354,7 @@ def main():
     }
 
     # Train
-    trainer = Phase2Trainer(config)
+    trainer = Phase2Trainer(config, affinity_mean=affinity_mean, affinity_std=affinity_std)
     results = trainer.train(train_data, val_data, test_data)
 
     print("\n" + "=" * 70)

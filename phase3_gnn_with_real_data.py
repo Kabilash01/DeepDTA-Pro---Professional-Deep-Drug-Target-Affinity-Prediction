@@ -24,6 +24,7 @@ from phase3_gnn_training import (
     Phase3GNNModel
 )
 from phase3_real_data import DAVISDatasetLoader
+from target_normalizer import AffinityNormalizer
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -36,10 +37,14 @@ logger = logging.getLogger(__name__)
 class Phase3RealDataTrainer:
     """Trainer for Phase 3 GNN with DAVIS/KIBA real datasets"""
 
-    def __init__(self, config: dict):
+    def __init__(self, config: dict, normalizer: AffinityNormalizer = None):
         self.config = config
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         logger.info(f"🖥️ Using device: {self.device}")
+
+        # Initialize normalizer
+        self.normalizer = normalizer if normalizer is not None else AffinityNormalizer()
+        logger.info(f"📊 {self.normalizer.info()}")
 
         self.model = Phase3GNNModel(gnn_hidden_dim=128, prot_embed_dim=128).to(self.device)
         logger.info(f"📊 Model parameters: {sum(p.numel() for p in self.model.parameters()):,}")
@@ -99,7 +104,8 @@ class Phase3RealDataTrainer:
 
                     # Forward pass
                     pred = self.model((x, edge_index), prot_ids)
-                    target = torch.tensor([[sample['affinity']]], dtype=torch.float32).to(self.device)
+                    normalized_target = self.normalizer.normalize(sample['affinity'])
+                    target = torch.tensor([[normalized_target]], dtype=torch.float32).to(self.device)
 
                     loss = self.criterion(pred, target)
                     batch_loss_sum += loss.item()
@@ -142,11 +148,13 @@ class Phase3RealDataTrainer:
                     prot_ids = self._sequence_to_ids(sample['protein_sequence']).to(self.device)
 
                     pred = self.model((x, edge_index), prot_ids)
-                    target = torch.tensor([[sample['affinity']]], dtype=torch.float32).to(self.device)
+                    normalized_target = self.normalizer.normalize(sample['affinity'])
+                    target = torch.tensor([[normalized_target]], dtype=torch.float32).to(self.device)
 
                     loss = self.criterion(pred, target)
                     total_loss += loss.item()
-                    predictions.append(pred.cpu().item())
+                    # Denormalize for metrics
+                    predictions.append(self.normalizer.denormalize(pred.cpu().item()))
                     targets.append(sample['affinity'])
 
                 except Exception as e:
@@ -265,8 +273,11 @@ def main():
     logger.info(f"   Learning Rate: {config['learning_rate']}")
     logger.info(f"   Max train samples: {config['max_samples']}")
 
+    # Create normalizer from stats
+    normalizer = AffinityNormalizer(mean=stats['affinity_mean'], std=stats['affinity_std'])
+
     # Train
-    trainer = Phase3RealDataTrainer(config)
+    trainer = Phase3RealDataTrainer(config, normalizer=normalizer)
     results = trainer.train(train_data, val_data, test_data)
 
     print("\n" + "=" * 80)

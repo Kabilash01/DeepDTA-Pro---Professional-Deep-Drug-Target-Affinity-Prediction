@@ -18,6 +18,7 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).parent))
 from phase3_real_data import DAVISDatasetLoader
+from target_normalizer import AffinityNormalizer
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -246,10 +247,14 @@ class Phase4TransferLearning(nn.Module):
 class Phase4Trainer:
     """Trainer for Phase 4 Transfer Learning"""
 
-    def __init__(self, config: dict):
+    def __init__(self, config: dict, normalizer: AffinityNormalizer = None):
         self.config = config
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         logger.info(f"🖥️ Using device: {self.device}")
+
+        # Initialize normalizer
+        self.normalizer = normalizer if normalizer is not None else AffinityNormalizer()
+        logger.info(f"📊 {self.normalizer.info()}")
 
         # Initialize tokenizers
         self.smiles_tokenizer = SimpleChemTokenizer(vocab_size=256)
@@ -296,9 +301,10 @@ class Phase4Trainer:
                     smiles_ids = self.smiles_tokenizer.encode(sample['drug_smiles']).unsqueeze(0).to(self.device)
                     protein_ids = self.protein_tokenizer.encode(sample['protein_sequence']).unsqueeze(0).to(self.device)
 
-                    # Forward pass
+                    # Forward pass with normalized target
                     pred = self.model(smiles_ids, protein_ids)
-                    target = torch.tensor([[sample['affinity']]], dtype=torch.float32).to(self.device)
+                    normalized_target = self.normalizer.normalize(sample['affinity'])
+                    target = torch.tensor([[normalized_target]], dtype=torch.float32).to(self.device)
 
                     loss = self.criterion(pred, target)
                     batch_loss_sum += loss.item()
@@ -338,11 +344,13 @@ class Phase4Trainer:
                     protein_ids = self.protein_tokenizer.encode(sample['protein_sequence']).unsqueeze(0).to(self.device)
 
                     pred = self.model(smiles_ids, protein_ids)
-                    target = torch.tensor([[sample['affinity']]], dtype=torch.float32).to(self.device)
+                    normalized_target = self.normalizer.normalize(sample['affinity'])
+                    target = torch.tensor([[normalized_target]], dtype=torch.float32).to(self.device)
 
                     loss = self.criterion(pred, target)
                     total_loss += loss.item()
-                    predictions.append(pred.cpu().item())
+                    # Denormalize for metrics calculation
+                    predictions.append(self.normalizer.denormalize(pred.cpu().item()))
                     targets.append(sample['affinity'])
 
                 except Exception as e:
@@ -462,8 +470,11 @@ def main():
     logger.info(f"   Learning Rate: {config['learning_rate']}")
     logger.info(f"   Freeze Encoders: {config['freeze_encoders']}")
 
+    # Create normalizer from stats
+    normalizer = AffinityNormalizer(mean=stats['affinity_mean'], std=stats['affinity_std'])
+
     # Train
-    trainer = Phase4Trainer(config)
+    trainer = Phase4Trainer(config, normalizer=normalizer)
     results = trainer.train(train_data, val_data, test_data)
 
     print("\n" + "=" * 80)
