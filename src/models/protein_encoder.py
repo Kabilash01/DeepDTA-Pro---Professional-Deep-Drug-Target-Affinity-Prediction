@@ -218,12 +218,16 @@ class ProteinTransformer(nn.Module):
         if lengths is not None:
             # Use actual lengths for mean pooling
             mask = ~padding_mask  # Inverse mask for valid positions
-            global_repr = (x * mask.unsqueeze(-1)).sum(dim=1) / lengths.unsqueeze(-1)
+            # Clamp lengths to avoid division by zero
+            safe_lengths = torch.clamp(lengths, min=1).unsqueeze(-1).float()
+            global_repr = (x * mask.unsqueeze(-1)).sum(dim=1) / safe_lengths
         else:
             # Use all positions for mean pooling
             mask = ~padding_mask
             seq_lengths = mask.sum(dim=1)
-            global_repr = (x * mask.unsqueeze(-1)).sum(dim=1) / seq_lengths.unsqueeze(-1)
+            # Clamp sequence lengths to avoid division by zero
+            safe_lengths = torch.clamp(seq_lengths, min=1).unsqueeze(-1).float()
+            global_repr = (x * mask.unsqueeze(-1)).sum(dim=1) / safe_lengths
         
         return {
             'sequence_representations': x,        # [batch_size, seq_len, embedding_dim]

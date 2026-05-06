@@ -30,9 +30,13 @@ class DavisDataset(Dataset):
         self.protein_features = protein_features
         self.affinities = affinities
         self.transform = transform
-        
-        assert len(drug_features) == len(protein_features) == len(affinities), \
-            "All inputs must have the same length"
+
+        # Validate lengths match
+        if not (len(drug_features) == len(protein_features) == len(affinities)):
+            raise ValueError(
+                f"Length mismatch: drugs={len(drug_features)}, "
+                f"proteins={len(protein_features)}, affinities={len(affinities)}"
+            )
     
     def __len__(self):
         return len(self.affinities)

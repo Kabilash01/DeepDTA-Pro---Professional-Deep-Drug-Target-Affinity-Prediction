@@ -405,9 +405,9 @@ def validate_input_data(df):
                 valid_smiles.append(True)
             else:
                 valid_smiles.append(False)
-        except:
+        except (ValueError, TypeError, AttributeError):
             valid_smiles.append(False)
-    
+
     # Validate protein sequences
     amino_acids = set('ACDEFGHIKLMNPQRSTVWY')
     for seq in df['protein_sequence']:
@@ -418,7 +418,7 @@ def validate_input_data(df):
                 valid_proteins.append(valid_chars and len(seq) >= 10)  # Minimum length
             else:
                 valid_proteins.append(False)
-        except:
+        except (ValueError, TypeError, AttributeError):
             valid_proteins.append(False)
     
     valid_mask = np.array(valid_smiles) & np.array(valid_proteins)

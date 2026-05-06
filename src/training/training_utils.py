@@ -99,6 +99,24 @@ class TrainingConfig:
         if self.scheduler_params is None:
             self.scheduler_params = {}
 
+        # Validate critical parameters
+        if self.num_epochs <= 0:
+            raise ValueError(f"num_epochs must be positive, got {self.num_epochs}")
+        if self.batch_size <= 0:
+            raise ValueError(f"batch_size must be positive, got {self.batch_size}")
+        if self.learning_rate <= 0:
+            raise ValueError(f"learning_rate must be positive, got {self.learning_rate}")
+        if self.weight_decay < 0:
+            raise ValueError(f"weight_decay must be non-negative, got {self.weight_decay}")
+        if self.monitor_mode not in ["min", "max"]:
+            raise ValueError(f"monitor_mode must be 'min' or 'max', got {self.monitor_mode}")
+        if self.early_stopping_patience < 0:
+            raise ValueError(f"early_stopping_patience must be non-negative, got {self.early_stopping_patience}")
+        if self.device not in ["auto", "cpu", "cuda", "mps"]:
+            raise ValueError(f"device must be 'auto', 'cpu', 'cuda', or 'mps', got {self.device}")
+        if self.num_workers < 0:
+            raise ValueError(f"num_workers must be non-negative, got {self.num_workers}")
+
 class LossRegistry:
     """Registry for loss functions."""
     

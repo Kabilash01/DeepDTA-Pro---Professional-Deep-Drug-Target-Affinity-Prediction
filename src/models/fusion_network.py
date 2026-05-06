@@ -170,7 +170,13 @@ class AttentionFusion(nn.Module):
         # Remove sequence dimension
         mol_attended = mol_attended.squeeze(1)   # [batch_size, hidden_dim]
         prot_attended = prot_attended.squeeze(1) # [batch_size, hidden_dim]
-        
+
+        # Validate shapes before concatenation
+        assert mol_attended.shape[0] == prot_attended.shape[0], \
+            f"Batch size mismatch: molecular {mol_attended.shape[0]} vs protein {prot_attended.shape[0]}"
+        assert mol_attended.dim() == 2 and prot_attended.dim() == 2, \
+            f"Expected 2D tensors after squeeze, got shapes {mol_attended.shape} and {prot_attended.shape}"
+
         # Concatenate and fuse
         combined = torch.cat([mol_attended, prot_attended], dim=-1)
         fused = self.fusion_layer(combined)

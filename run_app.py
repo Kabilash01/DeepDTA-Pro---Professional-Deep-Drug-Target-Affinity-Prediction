@@ -216,7 +216,7 @@ Examples:
         if not model_path.exists():
             logger.error(f"Model file not found: {model_path}")
             return
-        if not model_path.suffix in ['.pth', '.pt', '.pkl']:
+        if model_path.suffix not in ['.pth', '.pt', '.pkl']:
             logger.warning(f"Unusual model file extension: {model_path.suffix}")
     
     # Run the application

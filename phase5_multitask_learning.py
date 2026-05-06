@@ -275,11 +275,12 @@ class Phase5Trainer:
                     efficiency, solubility, toxicity = self.generate_auxiliary_targets(sample)
 
                     # Prepare targets
+                    toxicity_int = int(1 if sample.get('affinity', 5) > 7 else 0)
                     targets = {
                         'affinity': torch.tensor([[sample['affinity']]], dtype=torch.float32).to(self.device),
                         'efficiency': torch.tensor([[efficiency]], dtype=torch.float32).to(self.device),
                         'solubility': torch.tensor([[solubility]], dtype=torch.float32).to(self.device),
-                        'toxicity': torch.tensor([toxicity], dtype=torch.long).to(self.device)
+                        'toxicity': torch.tensor([toxicity_int], dtype=torch.long).to(self.device)
                     }
 
                     # Compute loss

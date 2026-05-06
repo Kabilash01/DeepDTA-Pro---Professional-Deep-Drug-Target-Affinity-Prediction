@@ -205,20 +205,32 @@ def main():
                 molecular_config=config['model']['molecular'],
                 protein_config=config['model']['protein'],
                 fusion_config=config['model']['fusion']
-            ).to(device)
-            
+            )
+
+            # Move model to device with error handling
+            try:
+                model = model.to(device)
+            except RuntimeError as e:
+                if 'out of memory' in str(e).lower():
+                    print(f"   ⚠️  GPU out of memory, falling back to CPU")
+                    device = torch.device('cpu')
+                    model = model.to(device)
+                else:
+                    raise
+
             # Count parameters
             total_params = sum(p.numel() for p in model.parameters())
             trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-            
-            print(f"   ✅ Model initialized")
+
+            print(f"   ✅ Model initialized on device: {device}")
             print(f"   📊 Total parameters: {total_params:,}")
             print(f"   🎯 Trainable parameters: {trainable_params:,}")
-            
-            logger.info(f"Model initialized with {total_params:,} parameters")
-            
+
+            logger.info(f"Model initialized with {total_params:,} parameters on {device}")
+
         except Exception as e:
             print(f"   ❌ Error initializing model: {e}")
+            logger.error(f"Model initialization failed: {e}", exc_info=True)
             return
         
         # Step 4: Setup training components
