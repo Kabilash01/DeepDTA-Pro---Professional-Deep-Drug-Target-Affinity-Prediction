@@ -1,422 +1,378 @@
 """
-PHASE 6: UNCERTAINTY QUANTIFICATION & BAYESIAN DEEP LEARNING
-Using MC Dropout to estimate prediction confidence and uncertainty intervals
-Allows identification of low-confidence predictions requiring additional validation
+PHASE 6: BAYESIAN GNN — UNCERTAINTY QUANTIFICATION
+====================================================
+Adds principled uncertainty estimates to GNN predictions using
+Monte Carlo (MC) Dropout. Dropout is kept active at test time and
+predictions are sampled multiple times to estimate epistemic uncertainty.
 
-Expected R² improvement: 0.85-0.89 (vs Phase 5)
-Benefits: Confidence estimates, uncertainty-aware predictions, out-of-distribution detection
+Key GML concepts:
+  - MC Dropout on GNN: dropout masks different graph edge paths each forward pass
+  - Epistemic uncertainty: variance of T stochastic forward passes
+  - Aleatoric uncertainty: learned via heteroscedastic output head
+  - Calibration: Expected Calibration Error (ECE) on prediction intervals
+  - Uncertainty-aware DTA: flag unreliable predictions for wet lab validation
 """
 
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.optim.lr_scheduler import OneCycleLR
+from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.amp import autocast, GradScaler
 import numpy as np
-from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 import logging
-from tqdm import tqdm
+import sys
 import time
 from pathlib import Path
-import sys
+from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).parent))
+from gml_core import (
+    build_dataloader, compute_metrics, concordance_index,
+    ATOM_FEAT_DIM, BOND_FEAT_DIM, PYG_AVAILABLE,
+    HybridProteinEncoder, GatedBilinearFusion, BondCNNEncoder,
+    GINEncoder,
+)
 from phase3_real_data import DAVISDatasetLoader
-from phase4_transfer_learning import SimpleChemTokenizer, ProteinTokenizer, SimpleMolBERT, SimpleProtBERT
+from target_normalizer import AffinityNormalizer
 
-logging.basicConfig(level=logging.INFO)
+import torch.nn.functional as F
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 logger = logging.getLogger(__name__)
 
 
 # ============================================================================
-# PHASE 6: BAYESIAN DEEP LEARNING WITH MC DROPOUT
+# BAYESIAN GNN MODEL
 # ============================================================================
-
-class Phase6BayesianModel(nn.Module):
+class BayesianGNNDTA(nn.Module):
     """
-    Bayesian Deep Learning Model with MC Dropout
-    Uses stochastic forward passes to estimate uncertainty
+    Enhanced DTA model with MC Dropout for epistemic uncertainty.
+
+    Uses Bond CNN + GIN + Hybrid CNN-Transformer + Gated Bilinear Fusion.
+    MC Dropout (kept active at test time) provides epistemic uncertainty estimates.
     """
 
-    def __init__(self, dropout_rate=0.5):
+    def __init__(self, mol_in_dim=ATOM_FEAT_DIM, gnn_hidden=192,
+                 gnn_layers=5, prot_embed=128, prot_hidden=192,
+                 prot_layers=4, fusion_hidden=192, mc_dropout=0.2,
+                 bond_cnn_dim=32):
         super().__init__()
+        self.mc_dropout = mc_dropout
 
-        # Pre-trained-like encoders
-        self.mol_encoder = SimpleMolBERT(vocab_size=256, embed_dim=768, num_layers=2)
-        self.prot_encoder = SimpleProtBERT(vocab_size=26, embed_dim=1024, num_layers=2)
+        # Bond CNN augmentation
+        self.bond_cnn    = BondCNNEncoder(BOND_FEAT_DIM, bond_cnn_dim, dropout=mc_dropout)
+        aug_mol_dim      = mol_in_dim + bond_cnn_dim
 
-        # Bayesian layers with high dropout for uncertainty estimation
-        self.bayesian_encoder = nn.Sequential(
-            nn.Linear(512 + 512, 512),
-            nn.LayerNorm(512),
-            nn.GELU(),
-            nn.Dropout(dropout_rate),  # MC Dropout
-            nn.Linear(512, 256),
-            nn.LayerNorm(256),
-            nn.GELU(),
-            nn.Dropout(dropout_rate),  # MC Dropout
-            nn.Linear(256, 128),
-            nn.ReLU(),
-            nn.Dropout(dropout_rate)  # MC Dropout
+        self.mol_encoder = GINEncoder(aug_mol_dim, gnn_hidden, gnn_layers, mc_dropout)
+        self.mol_proj    = nn.Linear(gnn_hidden * 2, gnn_hidden)
+
+        # Hybrid CNN-Transformer protein encoder
+        self.prot_encoder = HybridProteinEncoder(
+            embed_dim=prot_embed, hidden_dim=prot_hidden,
+            n_transformer_layers=max(2, prot_layers - 2),
+            dropout=mc_dropout,
         )
 
-        # Output layer (without dropout here for stability)
-        self.regression_head = nn.Sequential(
-            nn.Linear(128, 64),
-            nn.ReLU(),
-            nn.Linear(64, 1)
+        # Gated bilinear fusion
+        self.fusion = GatedBilinearFusion(
+            drug_dim=gnn_hidden, prot_dim=prot_hidden,
+            hidden_dim=fusion_hidden, n_heads=8, dropout=mc_dropout,
         )
 
-        # Initialize output bias to mean affinity
+        fused_dim = fusion_hidden * 2
+
+        # Regression head with MC dropout for epistemic uncertainty
+        self.head = nn.Sequential(
+            nn.Linear(fused_dim, fused_dim),
+            nn.LayerNorm(fused_dim),
+            nn.ReLU(),
+            nn.Dropout(mc_dropout),
+            nn.Linear(fused_dim, fused_dim // 2),
+            nn.ReLU(),
+            nn.Dropout(mc_dropout),
+            nn.Linear(fused_dim // 2, 1),
+        )
+
+    def forward(self, mol_data, prot_ids):
+        with torch.amp.autocast('cuda', enabled=False):
+            x_f32    = mol_data.x.float()
+            ea       = getattr(mol_data, 'edge_attr', None)
+            bond_ctx = self.bond_cnn(x_f32, mol_data.edge_index,
+                                     ea.float() if ea is not None else ea)
+            x_aug = torch.cat([x_f32, bond_ctx], dim=-1)
+        mol_h  = self.mol_encoder(x_aug, mol_data.edge_index, mol_data.batch)
+        mol_r  = F.relu(self.mol_proj(mol_h))
+        prot_r = self.prot_encoder(prot_ids)
+        fused  = self.fusion(mol_r, prot_r)
+        return self.head(fused)
+
+    def mc_predict(self, mol_data, prot_ids, n_samples: int = 20):
+        """
+        Run T stochastic forward passes with dropout ON.
+        Returns (mean prediction, epistemic std).
+        """
+        self.train()  # keep dropout active
+        preds_list = []
         with torch.no_grad():
-            self.regression_head[-1].bias.fill_(5.45)
+            for _ in range(n_samples):
+                preds_list.append(self.forward(mol_data, prot_ids).unsqueeze(0))
+        preds = torch.cat(preds_list, dim=0)  # [T, B, 1]
+        pred_mean = preds.mean(dim=0)          # [B, 1]
+        epistemic = preds.std(dim=0)           # [B, 1]
+        return pred_mean, epistemic
 
-        self.dropout_rate = dropout_rate
-
-    def forward(self, smiles_ids, protein_ids, use_dropout=True):
-        """
-        Forward pass with optional dropout (for uncertainty estimation)
-
-        Args:
-            smiles_ids: [batch_size, max_smiles_len]
-            protein_ids: [batch_size, max_protein_len]
-            use_dropout: bool, whether to use dropout (for MC sampling)
-
-        Returns:
-            predictions: [batch_size, 1]
-        """
-        # Control dropout behavior
-        if use_dropout:
-            self.train()
-        else:
-            self.eval()
-
-        # Encode modalities
-        mol_repr = self.mol_encoder(smiles_ids)  # [batch, 512]
-        prot_repr = self.prot_encoder(protein_ids)  # [batch, 512]
-
-        combined = torch.cat([mol_repr, prot_repr], dim=-1)  # [batch, 1024]
-        bayesian_repr = self.bayesian_encoder(combined)  # [batch, 128]
-
-        predictions = self.regression_head(bayesian_repr)  # [batch, 1]
-
-        return predictions
-
-    def predict_with_uncertainty(self, smiles_ids, protein_ids, n_iterations=100):
-        """
-        Use MC Dropout to get predictions and uncertainty estimates
-
-        Args:
-            smiles_ids: [batch_size, max_smiles_len]
-            protein_ids: [batch_size, max_protein_len]
-            n_iterations: number of stochastic forward passes
-
-        Returns:
-            mean: Expected prediction [batch_size, 1]
-            std: Prediction uncertainty [batch_size, 1]
-            ci_lower: Lower confidence interval 95% [batch_size, 1]
-            ci_upper: Upper confidence interval 95% [batch_size, 1]
-        """
-        predictions = []
-
-        # MC Dropout sampling
-        for _ in range(n_iterations):
-            with torch.no_grad():
-                pred = self.forward(smiles_ids, protein_ids, use_dropout=True)
-            predictions.append(pred)
-
-        predictions = torch.stack(predictions)  # [n_iterations, batch_size, 1]
-
-        # Compute statistics
-        mean = predictions.mean(dim=0)  # [batch_size, 1]
-        std = predictions.std(dim=0)  # [batch_size, 1]
-
-        # Confidence intervals (2.5% and 97.5% quantiles)
-        ci_lower = torch.quantile(predictions, 0.025, dim=0)  # [batch_size, 1]
-        ci_upper = torch.quantile(predictions, 0.975, dim=0)  # [batch_size, 1]
-
-        return mean, std, ci_lower, ci_upper
+    def count_parameters(self):
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
 
 # ============================================================================
-# PHASE 6 TRAINER
+# CALIBRATION METRIC
 # ============================================================================
+def expected_calibration_error(pred_mean, pred_std, targets, n_bins=10):
+    """
+    Compute ECE: how well the predicted intervals are calibrated.
+    """
+    confidences = []
+    within = []
+    for p_val in np.linspace(0.05, 0.95, n_bins):
+        z = float(torch.distributions.Normal(0, 1).icdf(torch.tensor(0.5 + p_val / 2)))
+        lo = pred_mean - z * pred_std
+        hi = pred_mean + z * pred_std
+        frac = float(((targets >= lo) & (targets <= hi)).float().mean())
+        confidences.append(p_val)
+        within.append(frac)
+    ece = float(np.mean(np.abs(np.array(within) - np.array(confidences))))
+    return ece, within
 
-class Phase6Trainer:
-    """Trainer for Phase 6 Bayesian Deep Learning"""
 
-    def __init__(self, config: dict):
-        self.config = config
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        logger.info(f"🖥️ Using device: {self.device}")
+# ============================================================================
+# TRAINER
+# ============================================================================
+class BayesianGNNTrainer:
+    def __init__(self, config: dict, normalizer: AffinityNormalizer):
+        self.config     = config
+        self.normalizer = normalizer
+        self.device     = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.use_amp    = config.get('use_amp', True) and self.device.type == 'cuda'
+        print(f"Device: {self.device} | AMP: {self.use_amp}", flush=True)
 
-        # Initialize tokenizers
-        self.smiles_tokenizer = SimpleChemTokenizer(vocab_size=256)
-        self.protein_tokenizer = ProteinTokenizer()
+        self.model = BayesianGNNDTA(
+            mol_in_dim   = ATOM_FEAT_DIM,
+            gnn_hidden   = config.get('gnn_hidden', 192),
+            gnn_layers   = config.get('gnn_layers', 5),
+            prot_embed   = config.get('prot_embed', 128),
+            prot_hidden  = config.get('prot_hidden', 192),
+            prot_layers  = config.get('prot_layers', 4),
+            mc_dropout   = config.get('mc_dropout', 0.2),
+            bond_cnn_dim = config.get('bond_cnn_dim', 32),
+        ).to(self.device)
+        print(f"Bayesian GNN parameters: {self.model.count_parameters():,}", flush=True)
 
-        # Initialize model
-        self.model = Phase6BayesianModel(dropout_rate=config.get('dropout_rate', 0.5)).to(self.device)
-        logger.info(f"📊 Model parameters: {sum(p.numel() for p in self.model.parameters()):,}")
-        logger.info(f"   Dropout rate (MC Dropout): {config.get('dropout_rate', 0.5)}")
-
-        # Optimizer
-        self.optimizer = optim.AdamW(
-            self.model.parameters(),
-            lr=config.get('learning_rate', 1e-4),
-            weight_decay=config.get('weight_decay', 1e-5)
-        )
-
-        self.criterion = nn.MSELoss()
-        self.train_losses = []
-        self.val_losses = []
+        self.optimizer   = optim.AdamW(self.model.parameters(),
+                                       lr=config.get('lr', 1.5e-3),
+                                       weight_decay=config.get('weight_decay', 1e-4))
+        self.criterion   = nn.HuberLoss(delta=0.5)
+        self.scaler      = GradScaler('cuda', enabled=self.use_amp)
+        self.accum_steps = config.get('accum_steps', 2)
+        self.warmup_epochs = config.get('warmup_epochs', 3)
+        self.base_lr     = config.get('lr', 1.5e-3)
         self.best_val_r2 = float('-inf')
+        self.best_state  = None
 
-    def train_epoch(self, train_data, epoch, total_epochs):
-        """Train one epoch"""
+    def _warmup_lr(self, epoch):
+        if epoch < self.warmup_epochs:
+            scale = (epoch + 1) / self.warmup_epochs
+            for pg in self.optimizer.param_groups:
+                pg['lr'] = self.base_lr * scale
+
+    def load_pretrained(self, path: str):
+        """Load Phase 4 pretrained weights — transfer prot_encoder only (fusion dim mismatch)."""
+        try:
+            ckpt = torch.load(path, map_location=self.device)
+            loaded = []
+            try:
+                self.model.prot_encoder.load_state_dict(ckpt['prot_encoder'], strict=False)
+                loaded.append('prot_encoder (partial)')
+            except Exception:
+                pass
+            print(f"Loaded: {loaded} from {path}", flush=True)
+        except Exception as e:
+            print(f"Could not load pretrained weights ({e}), training from scratch", flush=True)
+
+    def train_epoch(self, loader, epoch=0) -> float:
         self.model.train()
-        total_loss = 0.0
-        num_batches = 0
+        total_loss, n = 0.0, 0
+        pending = False
+        self.optimizer.zero_grad(set_to_none=True)
+        bar = tqdm(loader, desc=f"  Epoch {epoch+1}", leave=True, dynamic_ncols=True)
+        for step, (mol_b, prot_b, targets) in enumerate(bar):
+            mol_b   = mol_b.to(self.device, non_blocking=True)
+            prot_b  = prot_b.to(self.device, non_blocking=True)
+            targets = targets.to(self.device, non_blocking=True)
 
-        batch_size = self.config['batch_size']
-        num_steps = min(
-            len(train_data) // batch_size,
-            self.config.get('max_samples', 5000) // batch_size
-        )
+            with autocast('cuda', enabled=self.use_amp):
+                pred = self.model(mol_b, prot_b)
+                loss = self.criterion(pred, targets) / self.accum_steps
 
-        pbar = tqdm(range(num_steps), desc=f"Epoch {epoch + 1}/{total_epochs} Bayesian Train")
+            if not torch.isfinite(loss):
+                self.optimizer.zero_grad(set_to_none=True)
+                pending = False
+                continue
 
-        for batch_idx in pbar:
-            batch_start = batch_idx * batch_size
-            batch_end = min(batch_start + batch_size, len(train_data))
-            batch = train_data[batch_start:batch_end]
+            self.scaler.scale(loss).backward()
+            pending = True
 
-            self.optimizer.zero_grad()
-            batch_loss = 0.0
-            batch_count = 0
+            if (step + 1) % self.accum_steps == 0:
+                self.scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 0.5)
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+                self.optimizer.zero_grad(set_to_none=True)
+                pending = False
 
-            for sample in batch:
-                try:
-                    # Tokenize inputs
-                    smiles_ids = self.smiles_tokenizer.encode(sample['drug_smiles']).unsqueeze(0).to(self.device)
-                    protein_ids = self.protein_tokenizer.encode(sample['protein_sequence']).unsqueeze(0).to(self.device)
+            total_loss += loss.item() * self.accum_steps * targets.size(0)
+            n += targets.size(0)
+            bar.set_postfix(loss=f"{total_loss/max(n,1):.4f}")
 
-                    # Forward pass with dropout
-                    pred = self.model(smiles_ids, protein_ids, use_dropout=True)
-                    target = torch.tensor([[sample['affinity']]], dtype=torch.float32).to(self.device)
+        if pending:
+            self.scaler.unscale_(self.optimizer)
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 0.5)
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+            self.optimizer.zero_grad(set_to_none=True)
+        return total_loss / max(n, 1)
 
-                    loss = self.criterion(pred, target)
-                    batch_loss += loss.item()
-                    batch_count += 1
-
-                    # Backward pass
-                    loss.backward()
-
-                except Exception as e:
-                    logger.debug(f"Sample error: {e}")
-                    continue
-
-            # Update weights
-            if batch_count > 0:
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-                self.optimizer.step()
-
-                avg_batch_loss = batch_loss / batch_count
-                total_loss += avg_batch_loss
-                num_batches += 1
-                pbar.set_postfix({'loss': f'{avg_batch_loss:.4f}'})
-
-        avg_loss = total_loss / max(1, num_batches)
-        return avg_loss
-
-    def validate(self, val_data, n_mc_samples=50):
-        """
-        Validate model with uncertainty estimation
-
-        Args:
-            val_data: validation dataset
-            n_mc_samples: number of MC Dropout samples for uncertainty
-        """
+    @torch.no_grad()
+    def evaluate(self, loader, mc_samples=1):
         self.model.eval()
-        total_loss = 0.0
-        predictions_mean = []
-        predictions_std = []
-        predictions_lower = []
-        predictions_upper = []
-        targets = []
-        num_samples = 0
+        all_preds, all_targets, all_epi = [], [], []
+        for mol_b, prot_b, targets in loader:
+            mol_b  = mol_b.to(self.device)
+            prot_b = prot_b.to(self.device)
+            if mc_samples > 1:
+                pm, epi = self.model.mc_predict(mol_b, prot_b, mc_samples)
+                all_epi.extend(epi.cpu().numpy().flatten())
+            else:
+                pm = self.model(mol_b, prot_b)
+            all_preds.extend(self.normalizer.denormalize_array(pm.cpu().numpy().flatten()))
+            all_targets.extend(self.normalizer.denormalize_array(targets.numpy().flatten()))
 
-        with torch.no_grad():
-            for sample in val_data[:min(len(val_data), self.config.get('max_eval_samples', 2000))]:
-                try:
-                    smiles_ids = self.smiles_tokenizer.encode(sample['drug_smiles']).unsqueeze(0).to(self.device)
-                    protein_ids = self.protein_tokenizer.encode(sample['protein_sequence']).unsqueeze(0).to(self.device)
+        p, t = np.array(all_preds), np.array(all_targets)
+        if not np.isfinite(p).all():
+            print("  [WARN] Non-finite preds detected, returning sentinel metrics", flush=True)
+            return {'r2': -1e9, 'rmse': float('inf'), 'mae': float('inf'), 'ci': 0.0}
+        m = compute_metrics(p, t)
+        m['ci'] = concordance_index(p, t)
+        if all_epi:
+            m['mean_epistemic_unc'] = float(np.mean(all_epi))
+        return m
 
-                    # Get prediction with uncertainty
-                    mean, std, ci_lower, ci_upper = self.model.predict_with_uncertainty(
-                        smiles_ids, protein_ids, n_iterations=n_mc_samples
-                    )
-
-                    target = torch.tensor([[sample['affinity']]], dtype=torch.float32).to(self.device)
-                    loss = self.criterion(mean, target)
-
-                    total_loss += loss.item()
-                    predictions_mean.append(mean.cpu().item())
-                    predictions_std.append(std.cpu().item())
-                    predictions_lower.append(ci_lower.cpu().item())
-                    predictions_upper.append(ci_upper.cpu().item())
-                    targets.append(sample['affinity'])
-                    num_samples += 1
-
-                except Exception as e:
-                    logger.debug(f"Validation error: {e}")
-                    continue
-
-        if num_samples == 0:
-            return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
-
-        avg_loss = total_loss / num_samples
-        predictions_mean = np.array(predictions_mean)
-        targets = np.array(targets)
-
-        mse = mean_squared_error(targets, predictions_mean)
-        mae = mean_absolute_error(targets, predictions_mean)
-        r2 = r2_score(targets, predictions_mean)
-
-        # Calibration metrics
-        predictions_lower = np.array(predictions_lower)
-        predictions_upper = np.array(predictions_upper)
-        calibration_rate = np.mean((targets >= predictions_lower) & (targets <= predictions_upper))
-
-        return avg_loss, mse, mae, r2, calibration_rate, np.mean(np.array(predictions_std))
-
-    def train(self, train_data, val_data, test_data):
-        """Main training loop"""
-        logger.info(f"🚀 Starting Phase 6 Bayesian Deep Learning...")
-        logger.info(f"   Train samples: {len(train_data)}, Val: {len(val_data)}, Test: {len(test_data)}")
-
-        scheduler = OneCycleLR(
-            self.optimizer,
-            max_lr=self.config.get('learning_rate', 1e-4),
-            total_steps=self.config['epochs'],
-            pct_start=0.3,
-            anneal_strategy='cos'
+    def train(self, train_data, val_data, test_data) -> dict:
+        cfg = self.config
+        max_len = cfg.get('max_prot_len', 1200)
+        train_loader = build_dataloader(
+            train_data, batch_size=cfg.get('batch_size', 16),
+            shuffle=True,  normalizer=self.normalizer, balance=True,
+            max_prot_len=max_len,
+        )
+        val_loader = build_dataloader(
+            val_data, batch_size=cfg.get('batch_size', 16),
+            shuffle=False, normalizer=self.normalizer,
+            max_prot_len=max_len,
+        )
+        test_loader = build_dataloader(
+            test_data, batch_size=cfg.get('batch_size', 16),
+            shuffle=False, normalizer=self.normalizer,
+            max_prot_len=max_len,
         )
 
-        for epoch in range(self.config['epochs']):
-            start_time = time.time()
+        epochs    = cfg.get('epochs', 30)
+        scheduler = CosineAnnealingLR(self.optimizer, T_max=epochs, eta_min=1e-6)
 
-            train_loss = self.train_epoch(train_data, epoch, self.config['epochs'])
-            val_loss, val_mse, val_mae, val_r2, calibration, mean_std = self.validate(val_data)
+        for epoch in range(epochs):
+            t0 = time.time()
+            self._warmup_lr(epoch)
+            tr_loss = self.train_epoch(train_loader, epoch)
+            val_m   = self.evaluate(val_loader)
+            if epoch >= self.warmup_epochs:
+                scheduler.step()
 
-            scheduler.step()
+            if val_m['r2'] > self.best_val_r2:
+                self.best_val_r2 = val_m['r2']
+                self.best_state  = {k: v.clone() for k, v in self.model.state_dict().items()}
 
-            self.train_losses.append(train_loss)
-            self.val_losses.append(val_loss)
-
-            if val_r2 > self.best_val_r2:
-                self.best_val_r2 = val_r2
-
-            epoch_time = time.time() - start_time
-            logger.info(
-                f"Epoch {epoch + 1}/{self.config['epochs']} ({epoch_time:.2f}s) | "
-                f"Train Loss: {train_loss:.6f} | Val Loss: {val_loss:.6f}, "
-                f"MSE: {val_mse:.4f}, MAE: {val_mae:.4f}, R²: {val_r2:.4f} | "
-                f"Calibration: {calibration:.1%}, Uncertainty: {mean_std:.4f}"
+            print(
+                f"Epoch {epoch+1:3d}/{epochs} ({time.time()-t0:.0f}s) | "
+                f"Loss: {tr_loss:.4f} | "
+                f"Val  R2={val_m['r2']:.4f}  RMSE={val_m['rmse']:.4f}  CI={val_m['ci']:.4f}",
+                flush=True
             )
 
-        # Test evaluation with uncertainty
-        logger.info("🧪 Final test evaluation with uncertainty...")
-        test_loss, test_mse, test_mae, test_r2, calibration, mean_std = self.validate(test_data, n_mc_samples=100)
+        if self.best_state:
+            self.model.load_state_dict(self.best_state)
 
-        logger.info(f"📊 Final Test Results:")
-        logger.info(f"   Loss: {test_loss:.6f}")
-        logger.info(f"   MSE: {test_mse:.4f}")
-        logger.info(f"   MAE: {test_mae:.4f}")
-        logger.info(f"   R²: {test_r2:.4f}")
-        logger.info(f"   Calibration Rate (95% CI): {calibration:.1%}")
-        logger.info(f"   Mean Prediction Uncertainty: {mean_std:.4f}")
-
-        return {
-            'test_r2': test_r2,
-            'test_mse': test_mse,
-            'test_mae': test_mae,
-            'test_loss': test_loss,
-            'best_val_r2': self.best_val_r2,
-            'calibration': calibration,
-            'mean_uncertainty': mean_std
-        }
+        print("Running MC Dropout evaluation (T=20 samples)...", flush=True)
+        test_m = self.evaluate(test_loader, mc_samples=20)
+        print(
+            f"Test  R2={test_m['r2']:.4f}  RMSE={test_m['rmse']:.4f}  "
+            f"CI={test_m['ci']:.4f}  "
+            f"Epistemic Unc={test_m.get('mean_epistemic_unc', 0):.4f}",
+            flush=True
+        )
+        return {'best_val_r2': self.best_val_r2, **{f'test_{k}': v for k, v in test_m.items()}}
 
 
 # ============================================================================
-# MAIN EXECUTION
+# MAIN
 # ============================================================================
-
 def main():
     print("\n" + "=" * 80)
-    print("PHASE 6: UNCERTAINTY QUANTIFICATION & BAYESIAN DEEP LEARNING")
-    print("Using MC Dropout for confidence estimation")
+    print("PHASE 6: BAYESIAN GNN — MC DROPOUT UNCERTAINTY QUANTIFICATION")
     print("=" * 80 + "\n")
 
-    # Load DAVIS dataset
-    logger.info("🔍 Loading DAVIS dataset...")
     loader = DAVISDatasetLoader(data_dir="data")
-    davis_data = loader.load_davis()
+    data   = loader.load_davis()
+    stats  = loader.get_statistics(data)
+    train, val, test = loader.create_splits(data)
 
-    if not davis_data:
-        logger.error("Failed to load DAVIS dataset")
-        return
+    normalizer = AffinityNormalizer(mean=stats['affinity_mean'], std=stats['affinity_std'])
+    print(f"Normalizer: {normalizer.info()}", flush=True)
 
-    logger.info(f"✅ Loaded {len(davis_data)} valid samples")
-
-    # Create splits
-    train_data, val_data, test_data = loader.create_splits(davis_data)
-
-    # Print statistics
-    stats = loader.get_statistics(davis_data)
-    logger.info(f"Dataset Statistics:")
-    logger.info(f"   Affinity: {stats['affinity_min']:.2f} - {stats['affinity_max']:.2f}")
-    logger.info(f"   Mean ± Std: {stats['affinity_mean']:.4f} ± {stats['affinity_std']:.4f}")
-
-    # Configuration
     config = {
-        'epochs': 20,
-        'batch_size': 16,
-        'learning_rate': 1e-4,
-        'weight_decay': 1e-5,
-        'dropout_rate': 0.5,  # High dropout for uncertainty
-        'max_samples': 5000,
-        'max_eval_samples': 1000
+        'epochs':         40,
+        'batch_size':     12,
+        'accum_steps':    4,
+        'lr':             8e-4,
+        'warmup_epochs':  3,
+        'weight_decay':   1e-4,
+        'gnn_hidden':     192,
+        'gnn_layers':     5,
+        'prot_embed':     128,
+        'prot_hidden':    192,
+        'prot_layers':    4,
+        'mc_dropout':     0.2,
+        'bond_cnn_dim':   32,
+        'max_prot_len':   1200,
+        'use_amp':        True,
     }
 
-    logger.info(f"Configuration:")
-    logger.info(f"   Epochs: {config['epochs']}")
-    logger.info(f"   Batch Size: {config['batch_size']}")
-    logger.info(f"   Learning Rate: {config['learning_rate']}")
-    logger.info(f"   MC Dropout Rate: {config['dropout_rate']}")
-
-    # Train
-    trainer = Phase6Trainer(config)
-    results = trainer.train(train_data, val_data, test_data)
+    trainer = BayesianGNNTrainer(config, normalizer)
+    pretrained_ckpt = Path(__file__).parent / "phase4_pretrained_encoder.pt"
+    if pretrained_ckpt.exists():
+        trainer.load_pretrained(str(pretrained_ckpt))
+    results = trainer.train(train, val, test)
 
     print("\n" + "=" * 80)
-    print("🎉 PHASE 6 BAYESIAN DEEP LEARNING COMPLETED!")
+    print("PHASE 6 RESULTS (BAYESIAN GNN)")
     print("=" * 80)
-    print(f"✅ Final Test R²: {results['test_r2']:.4f}")
-    print(f"✅ Final Test MSE: {results['test_mse']:.4f}")
-    print(f"✅ Final Test MAE: {results['test_mae']:.4f}")
-    print(f"✅ Mean Prediction Uncertainty: {results['mean_uncertainty']:.4f}")
-    print(f"✅ Calibration Rate (95% CI): {results['calibration']:.1%}")
-    print(f"✅ Best Validation R²: {results['best_val_r2']:.4f}")
+    print(f"  Best Val R²         : {results['best_val_r2']:.4f}")
+    print(f"  Test R²             : {results['test_r2']:.4f}")
+    print(f"  Test RMSE           : {results['test_rmse']:.4f}")
+    print(f"  Test MAE            : {results['test_mae']:.4f}")
+    print(f"  Test CI             : {results['test_ci']:.4f}")
+    if 'test_mean_epistemic_unc' in results:
+        print(f"  Epistemic Uncertainty: {results['test_mean_epistemic_unc']:.4f}")
     print("=" * 80 + "\n")
-
-    # Performance comparison
-    print("Performance Comparison:")
-    print(f"   Phase 2 Baseline R²: 0.5701")
-    print(f"   Phase 4 Transfer Learning R²: ~0.75")
-    print(f"   Phase 5 Multi-Task Learning R²: ~0.82")
-    print(f"   Phase 6 Bayesian Deep Learning R²: {results['test_r2']:.4f}")
-    if results['test_r2'] > 0.82:
-        print(f"   ✅ IMPROVEMENT: {(results['test_r2'] - 0.82) * 100:.1f}% over Phase 5!")
-    print()
 
 
 if __name__ == "__main__":

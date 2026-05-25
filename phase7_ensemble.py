@@ -1,451 +1,393 @@
 """
-PHASE 7: ENSEMBLE METHODS & MODEL AGGREGATION
-Combines multiple models trained with different initializations/subsets
-Reduces variance, improves robustness, and provides ensemble uncertainty
+PHASE 7: GNN ENSEMBLE — MULTIPLE ARCHITECTURES
+================================================
+Combines GCN, GAT, and GIN models into an ensemble.
+Each model sees the same molecular graph but processes it differently,
+so their errors are partially independent — ensemble averaging reduces variance.
 
-Expected R² improvement: 0.90+ (vs Phase 6)
-Benefits: State-of-the-art performance, reduced overfitting, robust predictions
+Key GML concepts:
+  - Heterogeneous ensemble: different GNN architectures (GCN, GAT, GIN)
+  - Stochastic ensemble: same architecture, different random seeds
+  - Weighted averaging: learn optimal combination weights
+  - Ensemble uncertainty: std across member predictions
+  - Model diversity: measured by pairwise prediction correlation
 """
 
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.optim.lr_scheduler import OneCycleLR
+from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.amp import autocast, GradScaler
 import numpy as np
-from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 import logging
-from tqdm import tqdm
+import sys
 import time
 from pathlib import Path
-import sys
+from tqdm import tqdm
+from copy import deepcopy
 
 sys.path.insert(0, str(Path(__file__).parent))
+from gml_core import (
+    EnhancedDTAPredictor, build_dataloader, compute_metrics,
+    concordance_index, ATOM_FEAT_DIM, PYG_AVAILABLE,
+)
 from phase3_real_data import DAVISDatasetLoader
-from phase4_transfer_learning import SimpleChemTokenizer, ProteinTokenizer, SimpleMolBERT, SimpleProtBERT
+from target_normalizer import AffinityNormalizer
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 logger = logging.getLogger(__name__)
 
 
 # ============================================================================
-# PHASE 7: BASE ENSEMBLE MEMBER MODEL
+# SINGLE MODEL TRAINER (shared across all ensemble members)
 # ============================================================================
+def train_single_model(gnn_type: str, config: dict, normalizer: AffinityNormalizer,
+                       train_data, val_data, seed: int = 42):
+    """Train one GNN ensemble member with AMP + warmup + gradient accumulation."""
+    torch.manual_seed(seed)
+    np.random.seed(seed)
 
-class EnsembleMember(nn.Module):
-    """
-    Single ensemble member model
-    Uses transfer learning architecture with different initialization
-    """
+    device  = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    use_amp = config.get('use_amp', True) and device.type == 'cuda'
 
-    def __init__(self, member_id=0):
-        super().__init__()
+    model  = EnhancedDTAPredictor(
+        gnn_type     = gnn_type,
+        mol_in_dim   = ATOM_FEAT_DIM,
+        gnn_hidden   = config.get('gnn_hidden', 192),
+        gnn_layers   = config.get('gnn_layers', 4),
+        prot_embed   = config.get('prot_embed', 128),
+        prot_hidden  = config.get('prot_hidden', 192),
+        prot_layers  = config.get('prot_layers', 4),
+        dropout      = config.get('dropout', 0.1),
+        bond_cnn_dim = config.get('bond_cnn_dim', 32),
+    ).to(device)
 
-        # Pre-trained-like encoders
-        self.mol_encoder = SimpleMolBERT(vocab_size=256, embed_dim=768, num_layers=2)
-        self.prot_encoder = SimpleProtBERT(vocab_size=26, embed_dim=1024, num_layers=2)
+    # Load pretrained prot_encoder from Phase 4 (fusion dim differs — skip it)
+    pretrained_path = config.get('pretrained_path', None)
+    if pretrained_path and Path(pretrained_path).exists():
+        try:
+            ckpt = torch.load(pretrained_path, map_location=device)
+            try:
+                model.prot_encoder.load_state_dict(ckpt['prot_encoder'], strict=False)
+                print(f"  [{gnn_type.upper()} s={seed}] Loaded prot_encoder (partial)", flush=True)
+            except Exception:
+                pass
+        except Exception as e:
+            print(f"  [{gnn_type.upper()} s={seed}] Pretrained load skipped: {e}", flush=True)
 
-        # Interaction head
-        self.interaction = nn.Sequential(
-            nn.Linear(512 + 512, 512),
-            nn.LayerNorm(512),
-            nn.GELU(),
-            nn.Dropout(0.2),
-            nn.Linear(512, 256),
-            nn.LayerNorm(256),
-            nn.GELU(),
-            nn.Dropout(0.2),
-            nn.Linear(256, 128),
-            nn.ReLU(),
-            nn.LayerNorm(128),
-            nn.Linear(128, 1)
-        )
+    base_lr   = config.get('lr', 1.5e-3)
+    optimizer = optim.AdamW(model.parameters(), lr=base_lr,
+                            weight_decay=config.get('weight_decay', 1e-4))
+    criterion = nn.HuberLoss(delta=0.5)
+    scheduler = CosineAnnealingLR(optimizer,
+                                  T_max=config.get('epochs', 20), eta_min=1e-6)
+    scaler        = GradScaler('cuda', enabled=use_amp)
+    accum_steps   = config.get('accum_steps', 2)
+    warmup_epochs = config.get('warmup_epochs', 3)
 
-        # Initialize weights differently for each member
-        self._init_weights(member_id)
+    train_loader = build_dataloader(
+        train_data, batch_size=config.get('batch_size', 16),
+        shuffle=True,  normalizer=normalizer, balance=True,
+        max_prot_len=config.get('max_prot_len', 1200),
+    )
+    val_loader = build_dataloader(
+        val_data, batch_size=config.get('batch_size', 16),
+        shuffle=False, normalizer=normalizer,
+        max_prot_len=config.get('max_prot_len', 1200),
+    )
 
-        # Initialize output bias to mean affinity
+    best_val_r2 = float('-inf')
+    best_state  = None
+
+    for epoch in range(config.get('epochs', 20)):
+        # warmup
+        if epoch < warmup_epochs:
+            for pg in optimizer.param_groups:
+                pg['lr'] = base_lr * (epoch + 1) / warmup_epochs
+
+        model.train()
+        total_loss, n = 0.0, 0
+        pending = False
+        optimizer.zero_grad(set_to_none=True)
+        bar = tqdm(train_loader, desc=f"  [{gnn_type.upper()} s={seed}] Ep {epoch+1}",
+                   leave=True, dynamic_ncols=True)
+        for step, (mol_b, prot_b, targets) in enumerate(bar):
+            mol_b   = mol_b.to(device, non_blocking=True)
+            prot_b  = prot_b.to(device, non_blocking=True)
+            targets = targets.to(device, non_blocking=True)
+
+            with autocast('cuda', enabled=use_amp):
+                preds = model(mol_b, prot_b)
+                loss  = criterion(preds, targets) / accum_steps
+
+            if not torch.isfinite(loss):
+                optimizer.zero_grad(set_to_none=True)
+                pending = False
+                continue
+
+            scaler.scale(loss).backward()
+            pending = True
+
+            if (step + 1) % accum_steps == 0:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad(set_to_none=True)
+                pending = False
+
+            total_loss += loss.item() * accum_steps * targets.size(0)
+            n += targets.size(0)
+            bar.set_postfix(loss=f"{total_loss/max(n,1):.4f}")
+
+        if pending:
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad(set_to_none=True)
+
+        if epoch >= warmup_epochs:
+            scheduler.step()
+
+        # Validation
+        model.eval()
+        all_p, all_t = [], []
         with torch.no_grad():
-            self.interaction[-1].bias.fill_(5.45)
+            for mol_b, prot_b, targets in val_loader:
+                mol_b  = mol_b.to(device)
+                prot_b = prot_b.to(device)
+                p = model(mol_b, prot_b).cpu().numpy().flatten()
+                all_p.extend(normalizer.denormalize_array(p))
+                all_t.extend(normalizer.denormalize_array(targets.numpy().flatten()))
+        val_r2 = compute_metrics(np.array(all_p), np.array(all_t))['r2']
 
-        self.member_id = member_id
+        if val_r2 > best_val_r2:
+            best_val_r2 = val_r2
+            best_state  = deepcopy(model.state_dict())
 
-    def _init_weights(self, seed):
-        """Initialize weights with specific seed for diversity"""
-        torch.manual_seed(seed)
-        for module in self.modules():
-            if isinstance(module, nn.Linear):
-                nn.init.kaiming_normal_(module.weight, mode='fan_in', nonlinearity='relu')
-                if module.bias is not None:
-                    nn.init.constant_(module.bias, 0)
+        print(f"  [{gnn_type.upper()} seed={seed}] Epoch {epoch+1:3d}/{config['epochs']} | Val R2={val_r2:.4f}", flush=True)
 
-    def forward(self, smiles_ids, protein_ids):
-        """
-        Args:
-            smiles_ids: [batch_size, max_smiles_len]
-            protein_ids: [batch_size, max_protein_len]
-
-        Returns:
-            affinity_pred: [batch_size, 1]
-        """
-        mol_repr = self.mol_encoder(smiles_ids)
-        prot_repr = self.prot_encoder(protein_ids)
-        combined = torch.cat([mol_repr, prot_repr], dim=-1)
-        affinity = self.interaction(combined)
-        return affinity
+    model.load_state_dict(best_state)
+    return model.to(device), best_val_r2
 
 
 # ============================================================================
-# PHASE 7: ENSEMBLE MODEL
+# ENSEMBLE PREDICTOR
 # ============================================================================
-
-class Phase7Ensemble(nn.Module):
+class GNNEnsemble(nn.Module):
     """
-    Ensemble of multiple Phase 7 models
-    Uses voting/averaging and provides ensemble uncertainty
+    Heterogeneous GNN ensemble with learnable weighting.
+    Members: GCN, GAT, GIN (optionally repeated with different seeds).
     """
 
-    def __init__(self, n_models=5, device='cpu'):
+    def __init__(self, members: list):
         super().__init__()
-        self.n_models = n_models
-        self.device = device
+        self.members = nn.ModuleList(members)
+        n = len(members)
+        # Learnable per-member weight (softmax-normalized at inference)
+        self.weights = nn.Parameter(torch.ones(n) / n)
 
-        # Create ensemble members
-        self.members = nn.ModuleList([
-            EnsembleMember(member_id=i) for i in range(n_models)
-        ])
+    @property
+    def device(self):
+        return next(self.parameters()).device
 
-        logger.info(f"🎯 Created ensemble with {n_models} members")
-
-    def forward(self, smiles_ids, protein_ids, return_all=False):
+    def forward(self, mol_data, prot_ids, return_all=False):
         """
-        Ensemble forward pass
-
         Args:
-            smiles_ids: [batch_size, max_smiles_len]
-            protein_ids: [batch_size, max_protein_len]
-            return_all: bool, return predictions from all members
-
-        Returns:
-            mean: mean prediction [batch_size, 1]
-            std: ensemble uncertainty [batch_size, 1]
-            (optional) all_predictions: [n_models, batch_size, 1]
+            return_all: if True, return (weighted_mean, [member predictions])
         """
-        predictions = []
+        preds = []
+        for m in self.members:
+            p = m(mol_data, prot_ids)     # [B, 1]
+            preds.append(p)
 
-        for member in self.members:
-            pred = member(smiles_ids, protein_ids)
-            predictions.append(pred)
-
-        predictions = torch.stack(predictions)  # [n_models, batch_size, 1]
-
-        # Ensemble statistics
-        mean = predictions.mean(dim=0)  # [batch_size, 1]
-        std = predictions.std(dim=0)  # [batch_size, 1]
+        stack   = torch.stack(preds, dim=0)              # [M, B, 1]
+        w       = torch.softmax(self.weights, dim=0)     # [M]
+        w_view  = w.view(-1, 1, 1)
+        weighted = (stack * w_view).sum(dim=0)           # [B, 1]
 
         if return_all:
-            return mean, std, predictions
-        return mean, std
+            return weighted, [p.detach() for p in preds]
+        return weighted
 
-    def predict_with_full_info(self, smiles_ids, protein_ids):
-        """
-        Get detailed ensemble predictions
+    def predict_with_uncertainty(self, mol_data, prot_ids):
+        """Return (mean_pred, ensemble_std) — epistemic uncertainty proxy."""
+        weighted, all_preds = self.forward(mol_data, prot_ids, return_all=True)
+        if len(all_preds) > 1:
+            stack = torch.stack(all_preds, dim=0)    # [M, B, 1]
+            std   = stack.std(dim=0)                 # [B, 1]
+        else:
+            std = torch.zeros_like(weighted)
+        return weighted, std
 
-        Returns:
-            dict with mean, std, all predictions, and confidence metrics
-        """
-        mean, std, all_preds = self.forward(smiles_ids, protein_ids, return_all=True)
-
-        # Quantiles
-        q025 = torch.quantile(all_preds, 0.025, dim=0)
-        q975 = torch.quantile(all_preds, 0.975, dim=0)
-
-        return {
-            'mean': mean,
-            'std': std,
-            'q025': q025,
-            'q975': q975,
-            'all_predictions': all_preds
-        }
+    def member_weights(self):
+        w = torch.softmax(self.weights, dim=0).detach().cpu().numpy()
+        return {f'member_{i}': float(w[i]) for i in range(len(w))}
 
 
 # ============================================================================
-# PHASE 7 TRAINER
+# DIVERSITY METRICS
 # ============================================================================
-
-class Phase7Trainer:
-    """Trainer for Phase 7 Ensemble Methods"""
-
-    def __init__(self, config: dict):
-        self.config = config
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        logger.info(f"🖥️ Using device: {self.device}")
-
-        # Initialize tokenizers
-        self.smiles_tokenizer = SimpleChemTokenizer(vocab_size=256)
-        self.protein_tokenizer = ProteinTokenizer()
-
-        # Initialize ensemble
-        self.ensemble = Phase7Ensemble(
-            n_models=config.get('n_models', 5),
-            device=self.device
-        ).to(self.device)
-
-        total_params = sum(p.numel() for p in self.ensemble.parameters())
-        logger.info(f"📊 Ensemble total parameters: {total_params:,}")
-        logger.info(f"   ({total_params // 5:,} per member × 5)")
-
-        # Optimizers for each member
-        self.optimizers = [
-            optim.AdamW(
-                member.parameters(),
-                lr=config.get('learning_rate', 1e-4),
-                weight_decay=config.get('weight_decay', 1e-5)
-            )
-            for member in self.ensemble.members
-        ]
-
-        self.criterion = nn.MSELoss()
-        self.member_losses = [[] for _ in range(config.get('n_models', 5))]
-        self.ensemble_losses = []
-        self.best_ensemble_r2 = float('-inf')
-
-    def train_epoch(self, train_data, epoch, total_epochs):
-        """Train all ensemble members for one epoch"""
-        # Set all members to train mode
-        for member in self.ensemble.members:
-            member.train()
-
-        member_epoch_losses = [0.0 for _ in range(self.config.get('n_models', 5))]
-        member_batches = [0 for _ in range(self.config.get('n_models', 5))]
-
-        batch_size = self.config['batch_size']
-        num_steps = min(
-            len(train_data) // batch_size,
-            self.config.get('max_samples', 5000) // batch_size
-        )
-
-        pbar = tqdm(range(num_steps), desc=f"Epoch {epoch + 1}/{total_epochs} Ensemble Train")
-
-        for batch_idx in pbar:
-            batch_start = batch_idx * batch_size
-            batch_end = min(batch_start + batch_size, len(train_data))
-            batch = train_data[batch_start:batch_end]
-
-            # Zero gradients for all members
-            for optimizer in self.optimizers:
-                optimizer.zero_grad()
-
-            batch_count = 0
-
-            for sample in batch:
-                try:
-                    # Tokenize inputs
-                    smiles_ids = self.smiles_tokenizer.encode(sample['drug_smiles']).unsqueeze(0).to(self.device)
-                    protein_ids = self.protein_tokenizer.encode(sample['protein_sequence']).unsqueeze(0).to(self.device)
-                    target = torch.tensor([[sample['affinity']]], dtype=torch.float32).to(self.device)
-
-                    # Train each member
-                    for member_idx, (member, optimizer) in enumerate(zip(self.ensemble.members, self.optimizers)):
-                        pred = member(smiles_ids, protein_ids)
-                        loss = self.criterion(pred, target)
-
-                        member_epoch_losses[member_idx] += loss.item()
-                        member_batches[member_idx] += 1
-                        batch_count += 1
-
-                        # Backward pass
-                        loss.backward()
-
-                except Exception as e:
-                    logger.debug(f"Sample error: {e}")
-                    continue
-
-            # Update weights for all members
-            if batch_count > 0:
-                for optimizer in self.optimizers:
-                    torch.nn.utils.clip_grad_norm_(optimizer.param_groups[0]['params'], max_norm=1.0)
-                    optimizer.step()
-
-                avg_loss = np.mean([
-                    member_epoch_losses[i] / max(1, member_batches[i])
-                    for i in range(len(self.ensemble.members))
-                ])
-                pbar.set_postfix({'ensemble_loss': f'{avg_loss:.4f}'})
-
-        # Store results
-        for i in range(len(self.ensemble.members)):
-            avg_loss = member_epoch_losses[i] / max(1, member_batches[i])
-            self.member_losses[i].append(avg_loss)
-
-        return np.mean(member_epoch_losses) / max(1, np.sum(member_batches) + 1)
-
-    def validate(self, val_data):
-        """Validate entire ensemble"""
-        # Set all members to eval mode
-        for member in self.ensemble.members:
-            member.eval()
-
-        ensemble_predictions = []
-        targets = []
-
-        with torch.no_grad():
-            for sample in val_data[:min(len(val_data), self.config.get('max_eval_samples', 2000))]:
-                try:
-                    smiles_ids = self.smiles_tokenizer.encode(sample['drug_smiles']).unsqueeze(0).to(self.device)
-                    protein_ids = self.protein_tokenizer.encode(sample['protein_sequence']).unsqueeze(0).to(self.device)
-
-                    # Get ensemble prediction
-                    mean, std = self.ensemble(smiles_ids, protein_ids)
-
-                    ensemble_predictions.append(mean.cpu().item())
-                    targets.append(sample['affinity'])
-
-                except Exception as e:
-                    logger.debug(f"Validation error: {e}")
-                    continue
-
-        if len(ensemble_predictions) == 0:
-            return 0.0, 0.0, 0.0, 0.0
-
-        ensemble_predictions = np.array(ensemble_predictions)
-        targets = np.array(targets)
-
-        mse = mean_squared_error(targets, ensemble_predictions)
-        mae = mean_absolute_error(targets, ensemble_predictions)
-        r2 = r2_score(targets, ensemble_predictions)
-
-        loss = np.mean((targets - ensemble_predictions) ** 2)
-
-        return loss, mse, mae, r2
-
-    def train(self, train_data, val_data, test_data):
-        """Main training loop"""
-        logger.info(f"🚀 Starting Phase 7 Ensemble Methods...")
-        logger.info(f"   Train samples: {len(train_data)}, Val: {len(val_data)}, Test: {len(test_data)}")
-        logger.info(f"   Ensemble size: {self.config.get('n_models', 5)} members")
-
-        # Schedulers for all members
-        schedulers = [
-            OneCycleLR(
-                optimizer,
-                max_lr=self.config.get('learning_rate', 1e-4),
-                total_steps=self.config['epochs'],
-                pct_start=0.3,
-                anneal_strategy='cos'
-            )
-            for optimizer in self.optimizers
-        ]
-
-        for epoch in range(self.config['epochs']):
-            start_time = time.time()
-
-            train_loss = self.train_epoch(train_data, epoch, self.config['epochs'])
-            val_loss, val_mse, val_mae, val_r2 = self.validate(val_data)
-
-            # Step all schedulers
-            for scheduler in schedulers:
-                scheduler.step()
-
-            self.ensemble_losses.append(val_loss)
-
-            if val_r2 > self.best_ensemble_r2:
-                self.best_ensemble_r2 = val_r2
-
-            epoch_time = time.time() - start_time
-            logger.info(
-                f"Epoch {epoch + 1}/{self.config['epochs']} ({epoch_time:.2f}s) | "
-                f"Train Loss: {train_loss:.6f} | Val Loss: {val_loss:.6f}, "
-                f"MSE: {val_mse:.4f}, MAE: {val_mae:.4f}, R²: {val_r2:.4f}"
-            )
-
-        # Test evaluation
-        logger.info("🧪 Final test evaluation (ensemble)...")
-        test_loss, test_mse, test_mae, test_r2 = self.validate(test_data)
-
-        logger.info(f"📊 Final Ensemble Test Results:")
-        logger.info(f"   Loss: {test_loss:.6f}")
-        logger.info(f"   MSE: {test_mse:.4f}")
-        logger.info(f"   MAE: {test_mae:.4f}")
-        logger.info(f"   R²: {test_r2:.4f}")
-
-        return {
-            'test_r2': test_r2,
-            'test_mse': test_mse,
-            'test_mae': test_mae,
-            'test_loss': test_loss,
-            'best_val_r2': self.best_ensemble_r2
-        }
-
-
-# ============================================================================
-# MAIN EXECUTION
-# ============================================================================
-
-def main():
-    print("\n" + "=" * 80)
-    print("PHASE 7: ENSEMBLE METHODS & MODEL AGGREGATION")
-    print("Combining 5 diverse models for state-of-the-art predictions")
-    print("=" * 80 + "\n")
-
-    # Load DAVIS dataset
-    logger.info("🔍 Loading DAVIS dataset...")
-    loader = DAVISDatasetLoader(data_dir="data")
-    davis_data = loader.load_davis()
-
-    if not davis_data:
-        logger.error("Failed to load DAVIS dataset")
-        return
-
-    logger.info(f"✅ Loaded {len(davis_data)} valid samples")
-
-    # Create splits
-    train_data, val_data, test_data = loader.create_splits(davis_data)
-
-    # Print statistics
-    stats = loader.get_statistics(davis_data)
-    logger.info(f"Dataset Statistics:")
-    logger.info(f"   Affinity: {stats['affinity_min']:.2f} - {stats['affinity_max']:.2f}")
-    logger.info(f"   Mean ± Std: {stats['affinity_mean']:.4f} ± {stats['affinity_std']:.4f}")
-
-    # Configuration
-    config = {
-        'epochs': 20,
-        'batch_size': 16,
-        'learning_rate': 1e-4,
-        'weight_decay': 1e-5,
-        'n_models': 5,
-        'max_samples': 5000,
-        'max_eval_samples': 1000
+def ensemble_diversity(member_preds: list) -> dict:
+    """Compute pairwise Pearson correlation between member predictions."""
+    n = len(member_preds)
+    if n < 2:
+        return {}
+    corrs = []
+    for i in range(n):
+        for j in range(i + 1, n):
+            c = float(np.corrcoef(member_preds[i], member_preds[j])[0, 1])
+            corrs.append(c)
+    return {
+        'mean_pairwise_corr': float(np.mean(corrs)),
+        'min_pairwise_corr':  float(np.min(corrs)),
+        'diversity_score':    float(1.0 - np.mean(corrs)),
     }
 
-    logger.info(f"Configuration:")
-    logger.info(f"   Epochs: {config['epochs']}")
-    logger.info(f"   Batch Size: {config['batch_size']}")
-    logger.info(f"   Learning Rate: {config['learning_rate']}")
-    logger.info(f"   Ensemble Members: {config['n_models']}")
 
-    # Train
-    trainer = Phase7Trainer(config)
-    results = trainer.train(train_data, val_data, test_data)
+# ============================================================================
+# ENSEMBLE TRAINER
+# ============================================================================
+class EnsembleTrainer:
+    def __init__(self, config: dict, normalizer: AffinityNormalizer):
+        self.config     = config
+        self.normalizer = normalizer
+        self.device     = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
+    def build_and_train(self, train_data, val_data, test_data) -> dict:
+        cfg = self.config
+
+        # Define ensemble members: (gnn_type, seed) pairs
+        member_specs = [
+            ('gcn', 42),
+            ('gat', 42),
+            ('gin', 42),
+            ('gin', 123),   # second GIN with different seed
+            ('gat', 7),     # second GAT with different seed
+        ]
+
+        print(f"Training {len(member_specs)} ensemble members...", flush=True)
+        trained_members = []
+        member_val_r2s  = []
+
+        for gnn_type, seed in member_specs:
+            print(f"\n--- Training {gnn_type.upper()} (seed={seed}) ---", flush=True)
+            t0 = time.time()
+            model, val_r2 = train_single_model(
+                gnn_type, cfg, self.normalizer, train_data, val_data, seed
+            )
+            print(f"  Done in {time.time()-t0:.0f}s | Best Val R2={val_r2:.4f}", flush=True)
+            trained_members.append(model)
+            member_val_r2s.append(val_r2)
+
+        # Assemble ensemble
+        ensemble = GNNEnsemble(trained_members).to(self.device)
+        print(f"\nEnsemble assembled. Member weights: {ensemble.member_weights()}", flush=True)
+
+        # Evaluate on test set
+        test_loader = build_dataloader(
+            test_data, batch_size=cfg.get('batch_size', 16),
+            shuffle=False, normalizer=self.normalizer,
+            max_prot_len=cfg.get('max_prot_len', 1200),
+        )
+
+        ensemble.eval()
+        all_preds, all_targets, all_stds = [], [], []
+        member_preds_list = [[] for _ in trained_members]
+
+        with torch.no_grad():
+            for mol_b, prot_b, targets in tqdm(test_loader, desc="  Ensemble eval"):
+                mol_b  = mol_b.to(self.device)
+                prot_b = prot_b.to(self.device)
+                weighted, ind_preds = ensemble(mol_b, prot_b, return_all=True)
+                _, std = ensemble.predict_with_uncertainty(mol_b, prot_b)
+
+                all_preds.extend(self.normalizer.denormalize_array(
+                    weighted.cpu().numpy().flatten()))
+                all_targets.extend(self.normalizer.denormalize_array(
+                    targets.numpy().flatten()))
+                all_stds.extend(std.cpu().numpy().flatten())
+
+                for i, p in enumerate(ind_preds):
+                    member_preds_list[i].extend(p.cpu().numpy().flatten())
+
+        p_arr = np.array(all_preds)
+        t_arr = np.array(all_targets)
+        metrics = compute_metrics(p_arr, t_arr)
+        metrics['ci']   = concordance_index(p_arr, t_arr)
+        metrics['mean_ensemble_std'] = float(np.mean(all_stds))
+
+        # Per-member metrics
+        print("\n--- Per-Member Test Metrics ---", flush=True)
+        for i, (gnn_type, seed) in enumerate(member_specs):
+            m_preds = self.normalizer.denormalize_array(np.array(member_preds_list[i]))
+            m_met   = compute_metrics(m_preds, t_arr)
+            print(f"  {gnn_type.upper()} seed={seed}: R2={m_met['r2']:.4f}  RMSE={m_met['rmse']:.4f}", flush=True)
+
+        # Diversity
+        div = ensemble_diversity(member_preds_list)
+        print(f"\nEnsemble diversity: {div}", flush=True)
+        metrics.update(div)
+        metrics['member_val_r2s'] = member_val_r2s
+
+        return metrics
+
+
+# ============================================================================
+# MAIN
+# ============================================================================
+def main():
     print("\n" + "=" * 80)
-    print("🎉 PHASE 7 ENSEMBLE METHODS COMPLETED!")
-    print("=" * 80)
-    print(f"✅ Final Test R²: {results['test_r2']:.4f}")
-    print(f"✅ Final Test MSE: {results['test_mse']:.4f}")
-    print(f"✅ Final Test MAE: {results['test_mae']:.4f}")
-    print(f"✅ Best Validation R²: {results['best_val_r2']:.4f}")
+    print("PHASE 7: GNN ENSEMBLE — GCN + GAT + GIN HETEROGENEOUS ENSEMBLE")
     print("=" * 80 + "\n")
 
-    # Performance comparison
-    print("Performance Comparison:")
-    print(f"   Phase 2 Baseline R²: 0.5701")
-    print(f"   Phase 4 Transfer Learning R²: ~0.75")
-    print(f"   Phase 5 Multi-Task Learning R²: ~0.82")
-    print(f"   Phase 6 Bayesian Deep Learning R²: ~0.85")
-    print(f"   Phase 7 Ensemble Methods R²: {results['test_r2']:.4f}")
-    print(f"   ✅ FINAL IMPROVEMENT: {(results['test_r2'] - 0.5701) * 100:.1f}% over Phase 2 baseline!")
+    loader = DAVISDatasetLoader(data_dir="data")
+    data   = loader.load_davis()
+    stats  = loader.get_statistics(data)
+    train, val, test = loader.create_splits(data)
+
+    normalizer = AffinityNormalizer(mean=stats['affinity_mean'], std=stats['affinity_std'])
+    print(f"Normalizer: {normalizer.info()}", flush=True)
+    print(f"Train: {len(train)}  Val: {len(val)}  Test: {len(test)}", flush=True)
+
+    config = {
+        'epochs':         25,
+        'batch_size':     12,
+        'accum_steps':    4,
+        'lr':             8e-4,
+        'warmup_epochs':  3,
+        'weight_decay':   1e-4,
+        'gnn_hidden':     192,
+        'gnn_layers':     4,
+        'prot_embed':     128,
+        'prot_hidden':    192,
+        'prot_layers':    4,
+        'dropout':        0.1,
+        'bond_cnn_dim':   32,
+        'max_prot_len':   1200,
+        'use_amp':        True,
+        'pretrained_path': str(Path(__file__).parent / "phase4_pretrained_encoder.pt"),
+    }
+
+    trainer = EnsembleTrainer(config, normalizer)
+    results = trainer.build_and_train(train, val, test)
+
+    print("\n" + "=" * 80)
+    print("PHASE 7 RESULTS (GNN ENSEMBLE)")
+    print("=" * 80)
+    print(f"  Test R²              : {results['r2']:.4f}")
+    print(f"  Test RMSE            : {results['rmse']:.4f}")
+    print(f"  Test MAE             : {results['mae']:.4f}")
+    print(f"  Test CI              : {results['ci']:.4f}")
+    print(f"  Ensemble Uncertainty : {results['mean_ensemble_std']:.4f}")
+    print(f"  Diversity Score      : {results.get('diversity_score', 0):.4f}")
     print()
+    print("  Member Val R²s:")
+    specs = [('gcn',42),('gat',42),('gin',42),('gin',123),('gat',7)]
+    for (gnn_type, seed), r2 in zip(specs, results['member_val_r2s']):
+        print(f"    {gnn_type.upper()} seed={seed}: {r2:.4f}")
+    print("=" * 80 + "\n")
 
 
 if __name__ == "__main__":

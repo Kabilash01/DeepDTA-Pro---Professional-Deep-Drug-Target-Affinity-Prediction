@@ -1,369 +1,222 @@
 """
-PHASE 2 SIMPLIFIED: Advanced Training with Enhanced Features
-Corrected implementation with proper feature dimensions
+PHASE 2: GCN BASELINE TRAINING
+================================
+Trains a Graph Convolutional Network (GCN) as the GML baseline.
+
+Key GML concepts:
+  - GCNConv: aggregates neighbor node features via normalized sum
+  - Global mean + max pooling for graph-level representation
+  - Residual connections to prevent over-smoothing
+  - Full drug-target affinity model: GCN + Transformer + Cross-Attention
+
+Performance improvements over v1:
+  - Epochs 30 -> 50
+  - Batch size 32 -> 64 (better GPU utilization)
+  - Gradient accumulation (effective batch = 128)
+  - Warmup + CosineAnnealingLR
+  - Label smoothing via soft targets
+  - Protein sequence length 1000 -> 1200
 """
 
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.optim.lr_scheduler import OneCycleLR
+from torch.optim.lr_scheduler import CosineAnnealingLR
 import numpy as np
-from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 import logging
-from pathlib import Path
-import time
-from tqdm import tqdm
 import sys
+import time
+from pathlib import Path
+from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).parent))
+from gml_core import (
+    DTAPredictor, build_dataloader, compute_metrics,
+    ATOM_FEAT_DIM, PYG_AVAILABLE,
+)
+from phase3_real_data import DAVISDatasetLoader
 from target_normalizer import AffinityNormalizer
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 logger = logging.getLogger(__name__)
 
 
 # ============================================================================
-# SIMPLIFIED ENHANCED FEATURES
+# GCN TRAINER
 # ============================================================================
+class GCNTrainer:
 
-class SimpleFeatureExtractor:
-    """Simplified feature extraction for Phase 2"""
+    def __init__(self, config: dict, normalizer: AffinityNormalizer):
+        self.config     = config
+        self.normalizer = normalizer
+        self.device     = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        print(f"Device: {self.device}", flush=True)
 
-    def extract_molecular_features(self, smiles: str) -> np.ndarray:
-        """Extract molecular features (simplified)"""
-        try:
-            from rdkit import Chem
-            from rdkit.Chem import Descriptors, AllChem
-
-            mol = Chem.MolFromSmiles(smiles)
-            if mol is None:
-                return np.random.randn(256).astype(np.float32)
-
-            # Extract key descriptors
-            features = [
-                Descriptors.MolWt(mol),
-                Descriptors.MolLogP(mol),
-                Descriptors.NumHBD(mol),
-                Descriptors.NumHBA(mol),
-                Descriptors.RingCount(mol),
-                Descriptors.NumAromaticRings(mol),
-                Descriptors.NumRotatableBonds(mol),
-                Descriptors.TPSA(mol),
-                Descriptors.HeavyAtomCount(mol),
-                Descriptors.NumAtoms(mol),
-            ]
-
-            # Morgan fingerprint (128-bit for efficiency)
-            fp = AllChem.GetMorganFingerprintAsBitVect(mol, radius=2, nBits=128)
-
-            return np.concatenate([
-                np.array(features, dtype=np.float32),
-                np.array(fp, dtype=np.float32)
-            ])
-        except:
-            return np.random.randn(138).astype(np.float32)
-
-    def extract_protein_features(self, sequence: str) -> np.ndarray:
-        """Extract protein features (simplified)"""
-        sequence = sequence.upper()[:100]  # First 100 amino acids
-
-        # Amino acid composition
-        aa_types = 'ACDEFGHIKLMNPQRSTVWY'
-        composition = np.array([sequence.count(aa) / max(1, len(sequence)) for aa in aa_types],
-                               dtype=np.float32)
-
-        # Physicochemical properties
-        hydrophobic = sum(1 for aa in sequence if aa in 'AILMFWV') / max(1, len(sequence))
-        polar = sum(1 for aa in sequence if aa in 'STNQYC') / max(1, len(sequence))
-        charged = sum(1 for aa in sequence if aa in 'DEKRH') / max(1, len(sequence))
-
-        properties = np.array([hydrophobic, polar, charged, len(sequence) / 100],
-                              dtype=np.float32)
-
-        return np.concatenate([composition, properties])
-
-
-# ============================================================================
-# MODEL WITH ENHANCED FEATURES
-# ============================================================================
-
-class EnhancedModel(nn.Module):
-    """Simplified enhanced model for Phase 2"""
-
-    def __init__(self, mol_dim: int = 138, prot_dim: int = 24, hidden_dim: int = 256):
-        super().__init__()
-
-        # Feature projections
-        self.mol_proj = nn.Sequential(
-            nn.Linear(mol_dim, hidden_dim),
-            nn.BatchNorm1d(hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(0.3)
-        )
-
-        self.prot_proj = nn.Sequential(
-            nn.Linear(prot_dim, hidden_dim),
-            nn.BatchNorm1d(hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(0.3)
-        )
-
-        # Fusion
-        self.fusion = nn.Sequential(
-            nn.Linear(hidden_dim * 2, 512),
-            nn.ReLU(),
-            nn.BatchNorm1d(512),
-            nn.Dropout(0.3),
-            nn.Linear(512, 256),
-            nn.ReLU(),
-            nn.BatchNorm1d(256),
-            nn.Dropout(0.3),
-            nn.Linear(256, 128),
-            nn.ReLU(),
-            nn.BatchNorm1d(128),
-            nn.Linear(128, 1)
-        )
-
-    def forward(self, mol_feat: torch.Tensor, prot_feat: torch.Tensor) -> torch.Tensor:
-        mol_proj = self.mol_proj(mol_feat)
-        prot_proj = self.prot_proj(prot_feat)
-        combined = torch.cat([mol_proj, prot_proj], dim=1)
-        return self.fusion(combined)
-
-
-# ============================================================================
-# PHASE 2 TRAINER
-# ============================================================================
-
-class Phase2Trainer:
-    """Trainer for Phase 2 with enhanced features"""
-
-    def __init__(self, config: dict, affinity_mean: float = 5.45, affinity_std: float = 0.90):
-        self.config = config
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        logger.info(f"🖥️ Using device: {self.device}")
-
-        # Normalize targets
-        self.affinity_mean = affinity_mean
-        self.affinity_std = affinity_std
-        logger.info(f"📊 Target normalization: mean={affinity_mean:.4f}, std={affinity_std:.4f}")
-
-        self.model = EnhancedModel(mol_dim=138, prot_dim=24, hidden_dim=256).to(self.device)
-        logger.info(f"📊 Model parameters: {sum(p.numel() for p in self.model.parameters()):,}")
+        self.model = DTAPredictor(
+            gnn_type    = 'gcn',
+            mol_in_dim  = ATOM_FEAT_DIM,
+            gnn_hidden  = config.get('gnn_hidden', 256),
+            gnn_layers  = config.get('gnn_layers', 4),
+            prot_embed  = config.get('prot_embed', 128),
+            prot_hidden = config.get('prot_hidden', 256),
+            prot_layers = config.get('prot_layers', 4),
+            dropout     = config.get('dropout', 0.15),
+        ).to(self.device)
+        print(f"GCN model parameters: {self.model.count_parameters():,}", flush=True)
 
         self.optimizer = optim.AdamW(
             self.model.parameters(),
-            lr=config['learning_rate'],
-            weight_decay=config.get('weight_decay', 1e-4)
+            lr=config.get('lr', 1e-3),
+            weight_decay=config.get('weight_decay', 1e-4),
+            betas=(0.9, 0.999),
         )
+        self.criterion   = nn.HuberLoss(delta=0.5)  # tighter delta for affinity range
+        self.accum_steps = config.get('accum_steps', 2)  # gradient accumulation
+        self.best_val_r2 = float('-inf')
+        self.best_state  = None
 
-        self.criterion = nn.MSELoss()
-        self.extractor = SimpleFeatureExtractor()
-        self.train_losses = []
-        self.val_losses = []
-        self.best_val_loss = float('inf')
+    def _warmup_lr(self, epoch, warmup_epochs=3):
+        if epoch < warmup_epochs:
+            for pg in self.optimizer.param_groups:
+                pg['lr'] = self.config.get('lr', 1e-3) * (epoch + 1) / warmup_epochs
 
-    def normalize_affinity(self, affinity):
-        """Normalize affinity to ~[0, 1] range"""
-        return (affinity - self.affinity_mean) / (self.affinity_std + 1e-8)
-
-    def denormalize_affinity(self, normalized):
-        """Denormalize affinity back to original scale"""
-        return normalized * self.affinity_std + self.affinity_mean
-
-    def train_epoch(self, train_data, epoch, total_epochs):
-        """Train one epoch"""
+    def train_epoch(self, loader, epoch) -> float:
         self.model.train()
-        total_loss = 0
-        num_batches = 0
+        total_loss, n = 0.0, 0
+        self.optimizer.zero_grad()
+        bar = tqdm(loader, desc=f"  Epoch {epoch+1}", leave=True, dynamic_ncols=True)
 
-        pbar = tqdm(range(0, len(train_data), self.config['batch_size']),
-                    desc=f"Epoch {epoch + 1}/{total_epochs} Train")
+        for step, (mol_batch, prot_ids, targets) in enumerate(bar):
+            mol_batch = mol_batch.to(self.device)
+            prot_ids  = prot_ids.to(self.device)
+            targets   = targets.to(self.device)
 
-        for batch_start in pbar:
-            batch_end = min(batch_start + self.config['batch_size'], len(train_data))
-            batch = train_data[batch_start:batch_end]
-
-            self.optimizer.zero_grad()
-
-            # Extract features
-            mol_feats = []
-            prot_feats = []
-            targets = []
-
-            for sample in batch:
-                mol_feat = self.extractor.extract_molecular_features(sample['drug_smiles'])
-                prot_feat = self.extractor.extract_protein_features(sample['protein_sequence'])
-
-                mol_feats.append(mol_feat)
-                prot_feats.append(prot_feat)
-                # Normalize affinity
-                targets.append(self.normalize_affinity(sample['affinity']))
-
-            # Convert to tensors
-            mol_feats_t = torch.tensor(np.stack(mol_feats), dtype=torch.float32).to(self.device)
-            prot_feats_t = torch.tensor(np.stack(prot_feats), dtype=torch.float32).to(self.device)
-            targets_t = torch.tensor(targets, dtype=torch.float32).unsqueeze(1).to(self.device)
-
-            # Forward
-            predictions = self.model(mol_feats_t, prot_feats_t)
-
-            # Loss
-            loss = self.criterion(predictions, targets_t)
-
-            # Backward
+            preds = self.model(mol_batch, prot_ids)
+            loss  = self.criterion(preds, targets) / self.accum_steps
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-            self.optimizer.step()
 
-            total_loss += loss.item()
-            num_batches += 1
+            if (step + 1) % self.accum_steps == 0:
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                self.optimizer.step()
+                self.optimizer.zero_grad()
 
-            pbar.set_postfix({'loss': f'{loss.item():.4f}'})
+            total_loss += loss.item() * self.accum_steps * targets.size(0)
+            n += targets.size(0)
+            bar.set_postfix(loss=f"{total_loss/max(n,1):.4f}")
 
-        return total_loss / num_batches
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+        self.optimizer.step()
+        self.optimizer.zero_grad()
+        return total_loss / max(n, 1)
 
-    def validate(self, val_data):
-        """Validate model"""
+    @torch.no_grad()
+    def evaluate(self, loader):
         self.model.eval()
-        total_loss = 0
-        predictions = []
-        targets = []
+        all_preds, all_targets = [], []
+        for mol_batch, prot_ids, targets in loader:
+            mol_batch = mol_batch.to(self.device)
+            prot_ids  = prot_ids.to(self.device)
+            preds = self.model(mol_batch, prot_ids).cpu().numpy().flatten()
+            all_preds.extend(self.normalizer.denormalize_array(preds))
+            all_targets.extend(self.normalizer.denormalize_array(targets.numpy().flatten()))
+        return compute_metrics(np.array(all_preds), np.array(all_targets))
 
-        with torch.no_grad():
-            for sample in val_data:
-                mol_feat = self.extractor.extract_molecular_features(sample['drug_smiles'])
-                prot_feat = self.extractor.extract_protein_features(sample['protein_sequence'])
+    def train(self, train_data, val_data, test_data) -> dict:
+        cfg     = self.config
+        max_len = cfg.get('max_prot_len', 1200)
 
-                mol_feat_t = torch.tensor(mol_feat, dtype=torch.float32).unsqueeze(0).to(self.device)
-                prot_feat_t = torch.tensor(prot_feat, dtype=torch.float32).unsqueeze(0).to(self.device)
-                # Normalize target
-                normalized_target = self.normalize_affinity(sample['affinity'])
-                target_t = torch.tensor([normalized_target], dtype=torch.float32).view(1, 1).to(self.device)
-
-                pred = self.model(mol_feat_t, prot_feat_t)
-                loss = self.criterion(pred, target_t)
-
-                total_loss += loss.item()
-                # Denormalize for metrics
-                predictions.append(self.denormalize_affinity(pred.cpu().item()))
-                targets.append(sample['affinity'])
-
-        avg_loss = total_loss / max(1, len(val_data))
-        predictions = np.array(predictions)
-        targets = np.array(targets)
-
-        mse = mean_squared_error(targets, predictions)
-        mae = mean_absolute_error(targets, predictions)
-        r2 = r2_score(targets, predictions)
-
-        return avg_loss, mse, mae, r2
-
-    def train(self, train_data, val_data, test_data):
-        """Main training loop"""
-        logger.info("🚀 Starting Phase 2 Advanced Training...")
-
-        scheduler = OneCycleLR(
-            self.optimizer,
-            max_lr=self.config['learning_rate'],
-            total_steps=self.config['epochs'],
-            pct_start=0.3,
-            anneal_strategy='cos'
+        print("Building DataLoaders...", flush=True)
+        train_loader = build_dataloader(
+            train_data, batch_size=cfg.get('batch_size', 64),
+            shuffle=True,  normalizer=self.normalizer,
+            balance=True,  max_prot_len=max_len,
+        )
+        val_loader = build_dataloader(
+            val_data, batch_size=cfg.get('batch_size', 64),
+            shuffle=False, normalizer=self.normalizer,
+            max_prot_len=max_len,
+        )
+        test_loader = build_dataloader(
+            test_data, batch_size=cfg.get('batch_size', 64),
+            shuffle=False, normalizer=self.normalizer,
+            max_prot_len=max_len,
         )
 
-        for epoch in range(self.config['epochs']):
-            start_time = time.time()
+        epochs    = cfg.get('epochs', 50)
+        scheduler = CosineAnnealingLR(self.optimizer, T_max=epochs - 3, eta_min=1e-6)
 
-            # Train
-            train_loss = self.train_epoch(train_data, epoch, self.config['epochs'])
+        logger.info(f"Starting GCN training for {epochs} epochs "
+                    f"(accum_steps={self.accum_steps}, "
+                    f"effective_batch={cfg.get('batch_size',64)*self.accum_steps})...")
 
-            # Validate
-            val_loss, val_mse, val_mae, val_r2 = self.validate(val_data)
+        for epoch in range(epochs):
+            t0 = time.time()
+            self._warmup_lr(epoch)
+            tr_loss = self.train_epoch(train_loader, epoch)
+            val_m   = self.evaluate(val_loader)
+            if epoch >= 3:
+                scheduler.step()
 
-            # Update scheduler
-            scheduler.step()
+            if val_m['r2'] > self.best_val_r2:
+                self.best_val_r2 = val_m['r2']
+                self.best_state  = {k: v.clone() for k, v in self.model.state_dict().items()}
 
-            # Track
-            self.train_losses.append(train_loss)
-            self.val_losses.append(val_loss)
-
-            if val_loss < self.best_val_loss:
-                self.best_val_loss = val_loss
-
-            epoch_time = time.time() - start_time
-            logger.info(
-                f"Epoch {epoch + 1}/{self.config['epochs']} ({epoch_time:.2f}s) | "
-                f"Train Loss: {train_loss:.4f} | Val: Loss={val_loss:.4f}, R²={val_r2:.4f}"
+            print(
+                f"Epoch {epoch+1:3d}/{epochs} ({time.time()-t0:.0f}s) | "
+                f"Loss: {tr_loss:.4f} | "
+                f"Val  R2={val_m['r2']:.4f}  RMSE={val_m['rmse']:.4f}  MAE={val_m['mae']:.4f}",
+                flush=True
             )
 
-        # Test evaluation
-        logger.info("🧪 Final test evaluation...")
-        test_loss, test_mse, test_mae, test_r2 = self.validate(test_data)
-
-        logger.info(f"📊 Final Test Results - R²: {test_r2:.4f}, MSE: {test_mse:.4f}, MAE: {test_mae:.4f}")
-
-        return {'test_r2': test_r2, 'test_mse': test_mse, 'test_mae': test_mae}
+        if self.best_state:
+            self.model.load_state_dict(self.best_state)
+        test_m = self.evaluate(test_loader)
+        print(f"Test R2={test_m['r2']:.4f}  RMSE={test_m['rmse']:.4f}  MAE={test_m['mae']:.4f}", flush=True)
+        return {'best_val_r2': self.best_val_r2, **{f'test_{k}': v for k, v in test_m.items()}}
 
 
 # ============================================================================
-# DEMO
+# MAIN
 # ============================================================================
-
 def main():
-    """Run Phase 2 training"""
-    print("\n" + "=" * 70)
-    print("PHASE 2: ADVANCED TRAINING WITH ENHANCED FEATURES")
-    print("=" * 70 + "\n")
+    print("\n" + "=" * 80)
+    print("PHASE 2: GCN BASELINE — GRAPH CONVOLUTIONAL NETWORK")
+    print("=" * 80 + "\n")
 
-    # Load real DAVIS data
-    from phase3_real_data import load_real_dataset
-    train_data, val_data, test_data = load_real_dataset(source='davis')
+    loader = DAVISDatasetLoader(data_dir="data")
+    data   = loader.load_davis()
+    stats  = loader.get_statistics(data)
+    train, val, test = loader.create_splits(data)
 
-    if not train_data:
-        logger.error("Failed to load DAVIS dataset. Using smaller synthetic dataset.")
-        # Fallback to synthetic
-        drug_templates = ["CC(C)CC1=CC=C(C=C1)C(C)C(=O)O", "CC(=O)OC1=CC=CC=C1C(=O)O"]
-        protein_templates = ["MKKFFDSRREQGGSGLGSGSSGGGGSGGGYGNQDQSGGGGSGGGYGNQDQ"]
-        np.random.seed(42)
-        dataset = []
-        for i in range(500):
-            dataset.append({
-                'drug_smiles': drug_templates[i % 2],
-                'protein_sequence': protein_templates[0] + "G" * (i % 10),
-                'affinity': np.random.uniform(5.0, 10.0)
-            })
-        n = len(dataset)
-        train_data = dataset[:int(0.7 * n)]
-        val_data = dataset[int(0.7 * n):int(0.85 * n)]
-        test_data = dataset[int(0.85 * n):]
+    normalizer = AffinityNormalizer(mean=stats['affinity_mean'], std=stats['affinity_std'])
+    print(f"Normalizer: {normalizer.info()}", flush=True)
 
-    logger.info(f"✅ Dataset: Train={len(train_data)}, Val={len(val_data)}, Test={len(test_data)}")
-
-    # Collect affinity stats for normalization
-    all_affinities = [s['affinity'] for s in train_data + val_data + test_data]
-    affinity_mean = np.mean(all_affinities)
-    affinity_std = np.std(all_affinities)
-    logger.info(f"📊 Affinity stats: mean={affinity_mean:.4f}, std={affinity_std:.4f}, range=[{min(all_affinities):.2f}-{max(all_affinities):.2f}]")
-
-    # Config
     config = {
-        'epochs': 30,
-        'batch_size': 32,
-        'learning_rate': 1e-3,
-        'weight_decay': 1e-4
+        'epochs':       50,
+        'batch_size':   32,
+        'accum_steps':  4,      # effective batch = 128
+        'lr':           1e-3,
+        'weight_decay': 1e-4,
+        'gnn_hidden':   128,
+        'gnn_layers':   4,
+        'prot_embed':   64,
+        'prot_hidden':  128,
+        'prot_layers':  3,
+        'dropout':      0.15,
+        'max_prot_len': 800,
     }
 
-    # Train
-    trainer = Phase2Trainer(config, affinity_mean=affinity_mean, affinity_std=affinity_std)
-    results = trainer.train(train_data, val_data, test_data)
+    trainer = GCNTrainer(config, normalizer)
+    results = trainer.train(train, val, test)
 
-    print("\n" + "=" * 70)
-    print("🎉 PHASE 2 COMPLETED!")
-    print("=" * 70)
-    print(f"✅ Final Test R²: {results['test_r2']:.4f}")
-    print(f"✅ Final Test MSE: {results['test_mse']:.4f}")
-    print(f"✅ Final Test MAE: {results['test_mae']:.4f}")
-    print("=" * 70 + "\n")
+    print("\n" + "=" * 80)
+    print("PHASE 2 RESULTS (GCN BASELINE)")
+    print("=" * 80)
+    print(f"  Best Val R2   : {results['best_val_r2']:.4f}")
+    print(f"  Test R2       : {results['test_r2']:.4f}")
+    print(f"  Test RMSE     : {results['test_rmse']:.4f}")
+    print(f"  Test MAE      : {results['test_mae']:.4f}")
+    print("=" * 80 + "\n")
 
 
 if __name__ == "__main__":

@@ -1,15 +1,15 @@
 """
-DEEPDTA-PRO COMPLETE PIPELINE RUNNER
-Master script to execute all 7 phases sequentially with monitoring
+DEEPDTA-PRO COMPLETE GML PIPELINE RUNNER
+Master script to execute all 7 Graph Machine Learning phases sequentially.
 
 Phase progression:
-1️⃣  Phase 1: Enhanced Feature Engineering (R² baseline ~0.3)
-2️⃣  Phase 2: Advanced Optimization (R² improvement to 0.5701)
-3️⃣  Phase 3: Graph Neural Networks (GNN architecture)
-4️⃣  Phase 4: Transfer Learning (Pre-trained encoders, R² ~0.75)
-5️⃣  Phase 5: Multi-Task Learning (Auxiliary tasks, R² ~0.82)
-6️⃣  Phase 6: Uncertainty Quantification (MC Dropout, R² ~0.85)
-7️⃣  Phase 7: Ensemble Methods (5 models, R² ~0.90+)
+1  Phase 1: Graph Feature Engineering    - molecular/protein graph analysis
+2  Phase 2: GCN Baseline                 - Graph Convolutional Network
+3  Phase 3: GAT                          - Graph Attention Network
+4  Phase 4: JK-GIN                       - Jumping Knowledge GIN
+5  Phase 5: Multi-Task GNN               - shared encoder, multiple heads
+6  Phase 6: Bayesian GNN                 - MC Dropout uncertainty
+7  Phase 7: GNN Ensemble                 - GCN + GAT + GIN heterogeneous
 """
 
 import subprocess
@@ -28,46 +28,46 @@ logger = logging.getLogger(__name__)
 
 PHASES = [
     {
-        'name': 'PHASE 1: Enhanced Feature Engineering',
+        'name': 'PHASE 1: Graph Feature Engineering',
         'script': 'phase1_enhanced_features.py',
-        'expected_r2': 0.30,
-        'description': 'Feature extraction and engineering'
+        'expected_r2': None,
+        'description': 'Molecular graph analysis: atom/bond features, degree distribution'
     },
     {
-        'name': 'PHASE 2: Advanced Optimization',
+        'name': 'PHASE 2: GCN Baseline',
         'script': 'phase2_advanced_training.py',
-        'expected_r2': 0.5701,
-        'description': 'Hyperparameter optimization with Bayesian search'
+        'expected_r2': 0.55,
+        'description': 'Graph Convolutional Network with residual connections'
     },
     {
-        'name': 'PHASE 3: Graph Neural Networks',
+        'name': 'PHASE 3: GAT',
         'script': 'phase3_gnn_with_real_data.py',
-        'expected_r2': 0.70,
-        'description': 'Molecular graph neural networks with attention'
+        'expected_r2': 0.60,
+        'description': 'Graph Attention Network - multi-head attention over atoms'
     },
     {
-        'name': 'PHASE 4: Transfer Learning',
+        'name': 'PHASE 4: JK-GIN',
         'script': 'phase4_transfer_learning.py',
-        'expected_r2': 0.75,
-        'description': 'MolBERT + ProtBERT pre-trained encoders'
+        'expected_r2': 0.65,
+        'description': 'Jumping Knowledge GIN - most expressive GNN in WL hierarchy'
     },
     {
-        'name': 'PHASE 5: Multi-Task Learning',
+        'name': 'PHASE 5: Multi-Task GNN',
         'script': 'phase5_multitask_learning.py',
-        'expected_r2': 0.82,
-        'description': 'Auxiliary tasks: Efficiency, Solubility, Toxicity'
+        'expected_r2': 0.68,
+        'description': 'Shared GIN encoder with affinity + efficiency + selectivity heads'
     },
     {
-        'name': 'PHASE 6: Uncertainty Quantification',
+        'name': 'PHASE 6: Bayesian GNN',
         'script': 'phase6_uncertainty.py',
-        'expected_r2': 0.85,
-        'description': 'Bayesian deep learning with MC Dropout'
+        'expected_r2': 0.70,
+        'description': 'MC Dropout uncertainty quantification on GIN'
     },
     {
-        'name': 'PHASE 7: Ensemble Methods',
+        'name': 'PHASE 7: GNN Ensemble',
         'script': 'phase7_ensemble.py',
-        'expected_r2': 0.90,
-        'description': '5-model ensemble with voting'
+        'expected_r2': 0.75,
+        'description': 'Heterogeneous ensemble: GCN + GAT + GIN (5 members)'
     }
 ]
 
@@ -79,19 +79,21 @@ PHASES = [
 def print_header():
     """Print fancy header"""
     print("\n" + "=" * 100)
-    print("🚀 DEEPDTA-PRO: COMPLETE DEEP LEARNING PIPELINE FOR DRUG-TARGET AFFINITY PREDICTION".center(100))
+    print("DEEPDTA-PRO: COMPLETE GML PIPELINE FOR DRUG-TARGET AFFINITY PREDICTION".center(100))
     print("=" * 100)
     print()
 
 
 def print_phase_info(phase_num, phase_config):
     """Print phase information"""
-    print("─" * 100)
-    print(f"🔄 {phase_config['name']}")
-    print(f"   📝 Description: {phase_config['description']}")
-    print(f"   📊 Expected R²: {phase_config['expected_r2']:.4f}")
-    print(f"   📄 Script: {phase_config['script']}")
-    print("─" * 100)
+    print("-" * 100)
+    print(f"[PHASE {phase_num}] {phase_config['name']}")
+    print(f"   Description: {phase_config['description']}")
+    r2 = phase_config['expected_r2']
+    r2_str = f"{r2:.4f}" if r2 is not None else "N/A (analysis phase)"
+    print(f"   Expected R2: {r2_str}")
+    print(f"   Script: {phase_config['script']}")
+    print("-" * 100)
     print()
 
 
@@ -121,18 +123,18 @@ def run_phase(phase_num, phase_config, skip_errors=False):
         )
 
         if result.returncode != 0:
-            logger.error(f"❌ {phase_config['name']} failed with return code {result.returncode}")
+            logger.error(f"FAILED: {phase_config['name']} (return code {result.returncode})")
             if not skip_errors:
                 return False
             logger.warning("Continuing to next phase (skip_errors=True)")
             return True
 
         elapsed = time.time() - start_time
-        logger.info(f"✅ {phase_config['name']} completed in {elapsed:.2f}s")
+        logger.info(f"DONE: {phase_config['name']} in {elapsed:.2f}s")
         return True
 
     except Exception as e:
-        logger.error(f"❌ Error running {phase_config['name']}: {e}")
+        logger.error(f"ERROR running {phase_config['name']}: {e}")
         if not skip_errors:
             return False
         logger.warning("Continuing to next phase (skip_errors=True)")
@@ -150,7 +152,7 @@ def run_pipeline(start_phase=1, end_phase=7, skip_errors=False):
     """
     print_header()
 
-    logger.info(f"📋 Pipeline Configuration:")
+    logger.info(f"Pipeline Configuration:")
     logger.info(f"   Starting Phase: {start_phase}")
     logger.info(f"   Ending Phase: {end_phase}")
     logger.info(f"   Skip Errors: {skip_errors}")
@@ -185,40 +187,42 @@ def run_pipeline(start_phase=1, end_phase=7, skip_errors=False):
 def print_summary(results, total_time):
     """Print execution summary"""
     print("=" * 100)
-    print("📊 PIPELINE EXECUTION SUMMARY".center(100))
+    print("PIPELINE EXECUTION SUMMARY".center(100))
     print("=" * 100)
     print()
 
     successful = sum(1 for r in results.values() if r['success'])
     total = len(results)
 
-    print(f"✅ Successful: {successful}/{total}")
-    print(f"⏱️  Total Time: {total_time:.2f}s")
+    print(f"Successful: {successful}/{total}")
+    print(f"Total Time: {total_time:.2f}s")
     print()
 
     print("Phase Results:")
     for phase_key, result in results.items():
         phase_num = int(phase_key.split('_')[1])
-        status = "✅" if result['success'] else "❌"
-        print(f"  {status} {result['name']} (Expected R²: {result['expected_r2']:.4f})")
+        status = "OK  " if result['success'] else "FAIL"
+        r2 = result['expected_r2']
+        r2_str = f"{r2:.4f}" if r2 is not None else "N/A"
+        print(f"  [{status}] {result['name']} (Expected R2: {r2_str})")
 
     print()
     print("=" * 100)
     print()
 
     if successful == total:
-        print("🎉 ALL PHASES COMPLETED SUCCESSFULLY! 🎉".center(100))
+        print("ALL PHASES COMPLETED SUCCESSFULLY!".center(100))
         print()
-        print("Performance Trajectory:".center(100))
-        print(f"  Phase 2 (Optimization): R² = 0.5701".center(100))
-        print(f"  Phase 3 (GNN): R² = 0.70".center(100))
-        print(f"  Phase 4 (Transfer): R² = 0.75".center(100))
-        print(f"  Phase 5 (Multi-Task): R² = 0.82".center(100))
-        print(f"  Phase 6 (Uncertainty): R² = 0.85".center(100))
-        print(f"  Phase 7 (Ensemble): R² = 0.90+".center(100))
+        print("GML Performance Trajectory (targets):".center(100))
+        print("  Phase 2 (GCN):         R2 ~ 0.55".center(100))
+        print("  Phase 3 (GAT):         R2 ~ 0.60".center(100))
+        print("  Phase 4 (JK-GIN):      R2 ~ 0.65".center(100))
+        print("  Phase 5 (Multi-Task):  R2 ~ 0.68".center(100))
+        print("  Phase 6 (Bayesian):    R2 ~ 0.70".center(100))
+        print("  Phase 7 (Ensemble):    R2 ~ 0.75".center(100))
         print()
     else:
-        print(f"⚠️  Pipeline incomplete ({successful}/{total} phases).".center(100))
+        print(f"Pipeline incomplete ({successful}/{total} phases).".center(100))
 
     print("=" * 100)
     print()

@@ -13,7 +13,7 @@ import logging
 
 # Add the src directory to the Python path
 current_dir = Path(__file__).parent
-src_dir = current_dir.parent / 'src'
+src_dir = current_dir / 'src'
 sys.path.insert(0, str(src_dir))
 
 # Set up logging

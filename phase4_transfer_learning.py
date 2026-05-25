@@ -1,499 +1,398 @@
 """
-PHASE 4: TRANSFER LEARNING WITH PRE-TRAINED MODELS
-Using MolBERT and ProtBERT encoders for drug-target affinity prediction
-Expected R² improvement: 0.75-0.80+ (vs Phase 3)
+PHASE 4: GIN — GRAPH ISOMORPHISM NETWORK
+==========================================
+GIN is the most powerful GNN in the Weisfeiler-Lehman hierarchy.
+Adds graph-level fingerprint features for richer representations.
+
+Key GML concepts:
+  - GINConv: epsilon-scaled self-features + neighbor aggregation
+  - Trainable epsilon per layer (train_eps=True)
+  - MLP inside each GIN layer (vs single linear in GCN/GAT)
+  - Sum aggregation (not mean) — provably distinguishes more graph structures
+  - Hierarchical graph readout: concatenate pooling from all layers (JK-net style)
 """
 
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.optim.lr_scheduler import OneCycleLR
+from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
+from torch.cuda.amp import autocast, GradScaler
 import numpy as np
-from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 import logging
-from tqdm import tqdm
+import sys
 import time
 from pathlib import Path
-import sys
+from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).parent))
-from phase3_real_data import DAVISDatasetLoader
+from gml_core import (
+    DTAPredictor, build_dataloader, compute_metrics,
+    concordance_index, ATOM_FEAT_DIM, PYG_AVAILABLE,
+    GINEncoder, ProteinTransformerEncoder, CrossGraphAttention,
+)
+from phase3_real_data import DAVISDatasetLoader, KIBADatasetLoader
 from target_normalizer import AffinityNormalizer
 
-logging.basicConfig(level=logging.INFO)
+try:
+    from torch_geometric.nn import global_mean_pool, global_max_pool
+    from torch_geometric.data import Data
+    import torch.nn.functional as F
+    from torch_geometric.nn import GINConv
+except ImportError:
+    pass
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 logger = logging.getLogger(__name__)
 
-# ============================================================================
-# TOKENIZERS FOR SMILES AND PROTEIN SEQUENCES
-# ============================================================================
-
-class SimpleChemTokenizer:
-    """Simple SMILES tokenizer (works without external dependencies)"""
-
-    def __init__(self, vocab_size=256):
-        self.vocab_size = vocab_size
-        # Simple character-level tokenization
-        self.char2idx = {}
-        self.idx2char = {}
-
-        # Add special tokens
-        self.char2idx['<PAD>'] = 0
-        self.char2idx['<UNK>'] = 1
-        self.idx2char[0] = '<PAD>'
-        self.idx2char[1] = '<UNK>'
-
-        idx = 2
-        # Add common SMILES characters
-        for char in 'CNOSPBrClFI()=[]#@+-\\:':
-            if char not in self.char2idx:
-                self.char2idx[char] = idx
-                self.idx2char[idx] = char
-                idx += 1
-
-    def encode(self, smiles, max_length=100):
-        """Convert SMILES to token IDs"""
-        smiles = str(smiles)[:max_length]
-        tokens = []
-        for char in smiles:
-            if char in self.char2idx:
-                tokens.append(self.char2idx[char])
-            else:
-                tokens.append(self.char2idx['<UNK>'])
-
-        # Pad to max_length
-        while len(tokens) < max_length:
-            tokens.append(self.char2idx['<PAD>'])
-
-        return torch.tensor(tokens[:max_length], dtype=torch.long)
-
-
-class ProteinTokenizer:
-    """Simple protein sequence tokenizer"""
-
-    def __init__(self):
-        self.aa_to_idx = {
-            'A': 1, 'C': 2, 'D': 3, 'E': 4, 'F': 5, 'G': 6, 'H': 7, 'I': 8,
-            'K': 9, 'L': 10, 'M': 11, 'N': 12, 'P': 13, 'Q': 14, 'R': 15,
-            'S': 16, 'T': 17, 'V': 18, 'W': 19, 'Y': 20, 'X': 0, '<PAD>': 0, '<UNK>': 1
-        }
-
-    def encode(self, sequence, max_length=1000):
-        """Convert protein sequence to token IDs"""
-        sequence = str(sequence).upper()[:max_length]
-        tokens = []
-        for aa in sequence:
-            tokens.append(self.aa_to_idx.get(aa, self.aa_to_idx['<UNK>']))
-
-        # Pad to max_length
-        while len(tokens) < max_length:
-            tokens.append(self.aa_to_idx['<PAD>'])
-
-        return torch.tensor(tokens[:max_length], dtype=torch.long)
-
 
 # ============================================================================
-# PHASE 4: TRANSFER LEARNING MODEL (SIMPLIFIED MolBERT + ProtBERT)
+# JK-GIN: Jumping Knowledge GIN with hierarchical readout
 # ============================================================================
-
-class SimpleMolBERT(nn.Module):
-    """Simplified MolBERT-like encoder for molecules"""
-
-    def __init__(self, vocab_size=256, embed_dim=768, num_layers=2, num_heads=8):
-        super().__init__()
-        self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=0)
-
-        self.transformer = nn.TransformerEncoder(
-            nn.TransformerEncoderLayer(
-                d_model=embed_dim,
-                nhead=num_heads,
-                dim_feedforward=2048,
-                dropout=0.1,
-                batch_first=True,
-                activation='gelu'
-            ),
-            num_layers=num_layers
-        )
-
-        self.fc = nn.Linear(embed_dim, 512)
-
-    def forward(self, token_ids):
-        """
-        Args:
-            token_ids: [batch_size, seq_len]
-
-        Returns:
-            [batch_size, 512]
-        """
-        x = self.embedding(token_ids)  # [batch, seq_len, embed_dim]
-        x = self.transformer(x)  # [batch, seq_len, embed_dim]
-
-        # Use mean pooling + [CLS] equivalent
-        x = x.mean(dim=1)  # [batch, embed_dim]
-        x = self.fc(x)  # [batch, 512]
-
-        return x
-
-
-class SimpleProtBERT(nn.Module):
-    """Simplified ProtBERT-like encoder for proteins"""
-
-    def __init__(self, vocab_size=26, embed_dim=1024, num_layers=2, num_heads=8):
-        super().__init__()
-        self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=0)
-
-        self.transformer = nn.TransformerEncoder(
-            nn.TransformerEncoderLayer(
-                d_model=embed_dim,
-                nhead=num_heads,
-                dim_feedforward=2048,
-                dropout=0.1,
-                batch_first=True,
-                activation='gelu'
-            ),
-            num_layers=num_layers
-        )
-
-        self.fc = nn.Linear(embed_dim, 512)
-
-    def forward(self, token_ids):
-        """
-        Args:
-            token_ids: [batch_size, seq_len]
-
-        Returns:
-            [batch_size, 512]
-        """
-        x = self.embedding(token_ids)  # [batch, seq_len, embed_dim]
-        x = self.transformer(x)  # [batch, seq_len, embed_dim]
-
-        # Use mean pooling
-        x = x.mean(dim=1)  # [batch, embed_dim]
-        x = self.fc(x)  # [batch, 512]
-
-        return x
-
-
-# ============================================================================
-# PHASE 4 COMPLETE MODEL
-# ============================================================================
-
-class Phase4TransferLearning(nn.Module):
+class JKGINEncoder(nn.Module):
     """
-    Transfer Learning Model using simplified MolBERT + ProtBERT
-    Input: SMILES strings & protein sequences (tokenized)
-    Output: Binding affinity predictions
+    GIN encoder with Jumping Knowledge (JK) connections.
+    Concatenates graph-level pooled features from every layer, then projects
+    through a 2-layer MLP (prevents bottleneck information loss).
+    Per-layer residual GIN connections prevent oversmoothing.
     """
 
-    def __init__(self, freeze_encoders=False):
+    def __init__(self, in_dim: int, hidden_dim: int = 192,
+                 n_layers: int = 5, dropout: float = 0.1):
         super().__init__()
+        self.input_proj = nn.Linear(in_dim, hidden_dim)
+        self.convs  = nn.ModuleList()
+        self.norms  = nn.ModuleList()
+        for _ in range(n_layers):
+            mlp = nn.Sequential(
+                nn.Linear(hidden_dim, hidden_dim * 2),
+                nn.BatchNorm1d(hidden_dim * 2),
+                nn.ReLU(),
+                nn.Linear(hidden_dim * 2, hidden_dim),
+            )
+            self.convs.append(GINConv(mlp, train_eps=True))
+            self.norms.append(nn.BatchNorm1d(hidden_dim))
 
-        # Pre-trained-like encoders
-        self.mol_encoder = SimpleMolBERT(vocab_size=256, embed_dim=768, num_layers=2)
-        self.prot_encoder = SimpleProtBERT(vocab_size=26, embed_dim=1024, num_layers=2)
-
-        # Optionally freeze encoders
-        if freeze_encoders:
-            for param in self.mol_encoder.parameters():
-                param.requires_grad = False
-            for param in self.prot_encoder.parameters():
-                param.requires_grad = False
-
-        # Interaction head
-        self.interaction = nn.Sequential(
-            nn.Linear(512 + 512, 512),
-            nn.LayerNorm(512),
-            nn.GELU(),
-            nn.Dropout(0.2),
-            nn.Linear(512, 256),
-            nn.LayerNorm(256),
-            nn.GELU(),
-            nn.Dropout(0.2),
-            nn.Linear(256, 128),
+        self.n_layers = n_layers
+        self.dropout  = nn.Dropout(dropout)
+        # JK: 2-layer MLP projection prevents the 640->128 information bottleneck.
+        # Concatenated readouts: hidden*(n_layers+1)  ->  256  ->  hidden
+        self.jk_proj = nn.Sequential(
+            nn.Linear(hidden_dim * (n_layers + 1), 256),
             nn.ReLU(),
-            nn.LayerNorm(128),
-            nn.Linear(128, 1)
+            nn.Dropout(dropout),
+            nn.Linear(256, hidden_dim),
+        )
+        self.out_dim  = hidden_dim
+
+    def forward(self, x: torch.Tensor, edge_index: torch.Tensor,
+                batch: torch.Tensor) -> torch.Tensor:
+        h = F.relu(self.input_proj(x))
+        layer_readouts = [global_mean_pool(h, batch)]  # layer 0
+
+        for conv, norm in zip(self.convs, self.norms):
+            h_new = F.relu(norm(conv(h, edge_index)))
+            h_new = self.dropout(h_new)
+            h = h + h_new  # residual to prevent oversmoothing
+            layer_readouts.append(global_mean_pool(h, batch))
+
+        # JK concatenation + MLP projection
+        jk = torch.cat(layer_readouts, dim=-1)  # [B, hidden*(n_layers+1)]
+        return F.relu(self.jk_proj(jk))          # [B, hidden]
+
+
+# ============================================================================
+# FULL GIN MODEL
+# ============================================================================
+class GINDTAPredictor(nn.Module):
+    """DTA predictor with JK-GIN molecular encoder."""
+
+    def __init__(self, mol_in_dim=ATOM_FEAT_DIM, gnn_hidden=256,
+                 gnn_layers=5, prot_embed=128, prot_hidden=256,
+                 prot_layers=4, fusion_hidden=256, dropout=0.2):
+        super().__init__()
+        self.mol_encoder  = JKGINEncoder(mol_in_dim, gnn_hidden, gnn_layers, dropout)
+        self.prot_encoder = ProteinTransformerEncoder(
+            embed_dim=prot_embed, hidden_dim=prot_hidden,
+            n_layers=prot_layers, dropout=dropout,
+        )
+        self.fusion = CrossGraphAttention(
+            drug_dim=gnn_hidden, prot_dim=prot_hidden,
+            hidden_dim=fusion_hidden, n_heads=8,
+        )
+        fused_dim = fusion_hidden * 2
+        self.head = nn.Sequential(
+            nn.Linear(fused_dim, fused_dim),
+            nn.LayerNorm(fused_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(fused_dim, fused_dim // 2),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(fused_dim // 2, 1),
         )
 
-        # Initialize output bias to mean affinity
-        with torch.no_grad():
-            self.interaction[-1].bias.fill_(5.45)  # Mean DAVIS affinity
+    def forward(self, mol_data, prot_ids):
+        mol_r  = self.mol_encoder(mol_data.x, mol_data.edge_index, mol_data.batch)
+        prot_r = self.prot_encoder(prot_ids)
+        fused  = self.fusion(mol_r, prot_r)
+        return self.head(fused)
 
-    def forward(self, smiles_ids, protein_ids):
-        """
-        Args:
-            smiles_ids: [batch_size, max_smiles_len]
-            protein_ids: [batch_size, max_protein_len]
-
-        Returns:
-            affinity_pred: [batch_size, 1]
-        """
-        # Encode modalities
-        mol_repr = self.mol_encoder(smiles_ids)  # [batch, 512]
-        prot_repr = self.prot_encoder(protein_ids)  # [batch, 512]
-
-        # Concatenate representations
-        combined = torch.cat([mol_repr, prot_repr], dim=-1)  # [batch, 1024]
-
-        # Predict affinity
-        affinity = self.interaction(combined)  # [batch, 1]
-
-        return affinity
+    def count_parameters(self):
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
 
 # ============================================================================
-# PHASE 4 TRAINER
+# TRAINER
 # ============================================================================
+class GINTrainer:
+    def __init__(self, config: dict, normalizer: AffinityNormalizer):
+        self.config     = config
+        self.normalizer = normalizer
+        self.device     = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.use_amp    = config.get('use_amp', True) and self.device.type == 'cuda'
+        print(f"Device: {self.device} | AMP: {self.use_amp}", flush=True)
 
-class Phase4Trainer:
-    """Trainer for Phase 4 Transfer Learning"""
+        self.model = GINDTAPredictor(
+            mol_in_dim  = ATOM_FEAT_DIM,
+            gnn_hidden  = config.get('gnn_hidden', 192),
+            gnn_layers  = config.get('gnn_layers', 5),
+            prot_embed  = config.get('prot_embed', 128),
+            prot_hidden = config.get('prot_hidden', 192),
+            prot_layers = config.get('prot_layers', 4),
+            dropout     = config.get('dropout', 0.1),
+        ).to(self.device)
+        print(f"JK-GIN model parameters: {self.model.count_parameters():,}", flush=True)
 
-    def __init__(self, config: dict, normalizer: AffinityNormalizer = None):
-        self.config = config
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        logger.info(f"🖥️ Using device: {self.device}")
-
-        # Initialize normalizer
-        self.normalizer = normalizer if normalizer is not None else AffinityNormalizer()
-        logger.info(f"📊 {self.normalizer.info()}")
-
-        # Initialize tokenizers
-        self.smiles_tokenizer = SimpleChemTokenizer(vocab_size=256)
-        self.protein_tokenizer = ProteinTokenizer()
-
-        # Initialize model
-        self.model = Phase4TransferLearning(freeze_encoders=config.get('freeze_encoders', False)).to(self.device)
-        logger.info(f"📊 Model parameters: {sum(p.numel() for p in self.model.parameters()):,}")
-
-        # Optimizer (lower LR for transfer learning)
         self.optimizer = optim.AdamW(
             self.model.parameters(),
-            lr=config.get('learning_rate', 1e-4),
-            weight_decay=config.get('weight_decay', 1e-5)
+            lr=config.get('lr', 1.5e-3),
+            weight_decay=config.get('weight_decay', 1e-4),
         )
-
-        self.criterion = nn.MSELoss()
-        self.train_losses = []
-        self.val_losses = []
+        self.criterion   = nn.HuberLoss(delta=0.5)
+        self.scaler      = GradScaler(enabled=self.use_amp)
+        self.accum_steps = config.get('accum_steps', 2)
+        self.warmup_epochs = config.get('warmup_epochs', 3)
+        self.base_lr       = config.get('lr', 1.5e-3)
         self.best_val_r2 = float('-inf')
+        self.best_state  = None
 
-    def train_epoch(self, train_data, epoch, total_epochs):
-        """Train one epoch"""
+    def _warmup_lr(self, epoch):
+        if epoch < self.warmup_epochs:
+            scale = (epoch + 1) / self.warmup_epochs
+            for pg in self.optimizer.param_groups:
+                pg['lr'] = self.base_lr * scale
+
+    def train_epoch(self, loader, epoch=0) -> float:
         self.model.train()
-        total_loss = 0.0
-        num_samples = 0
+        total_loss, n = 0.0, 0
+        pending = False  # whether we have un-stepped grads accumulating
+        self.optimizer.zero_grad(set_to_none=True)
+        bar = tqdm(loader, desc=f"  Epoch {epoch+1}", leave=True, dynamic_ncols=True)
+        for step, (mol_batch, prot_ids, targets) in enumerate(bar):
+            mol_batch = mol_batch.to(self.device, non_blocking=True)
+            prot_ids  = prot_ids.to(self.device, non_blocking=True)
+            targets   = targets.to(self.device, non_blocking=True)
 
-        pbar = tqdm(
-            range(0, min(len(train_data), self.config.get('max_samples', 5000)), self.config['batch_size']),
-            desc=f"Epoch {epoch + 1}/{total_epochs} Transfer Train"
-        )
+            with autocast(enabled=self.use_amp):
+                preds = self.model(mol_batch, prot_ids)
+                loss  = self.criterion(preds, targets) / self.accum_steps
 
-        for batch_start in pbar:
-            batch_end = min(batch_start + self.config['batch_size'], len(train_data))
-            batch = train_data[batch_start:batch_end]
+            # skip step if loss is non-finite (FP16 overflow can produce nan/inf)
+            if not torch.isfinite(loss):
+                self.optimizer.zero_grad(set_to_none=True)
+                pending = False
+                continue
 
-            self.optimizer.zero_grad()
-            batch_loss_sum = 0.0
-            batch_samples = 0
+            self.scaler.scale(loss).backward()
+            pending = True
 
-            for sample in batch:
-                try:
-                    # Tokenize inputs
-                    smiles_ids = self.smiles_tokenizer.encode(sample['drug_smiles']).unsqueeze(0).to(self.device)
-                    protein_ids = self.protein_tokenizer.encode(sample['protein_sequence']).unsqueeze(0).to(self.device)
+            if (step + 1) % self.accum_steps == 0:
+                self.scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 0.5)
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+                self.optimizer.zero_grad(set_to_none=True)
+                pending = False
 
-                    # Forward pass with normalized target
-                    pred = self.model(smiles_ids, protein_ids)
-                    normalized_target = self.normalizer.normalize(sample['affinity'])
-                    target = torch.tensor([[normalized_target]], dtype=torch.float32).to(self.device)
+            total_loss += loss.item() * self.accum_steps * targets.size(0)
+            n += targets.size(0)
+            bar.set_postfix(loss=f"{total_loss/max(n,1):.4f}")
 
-                    loss = self.criterion(pred, target)
-                    batch_loss_sum += loss.item()
-                    batch_samples += 1
+        # flush any leftover partial accumulation (only if pending)
+        if pending:
+            self.scaler.unscale_(self.optimizer)
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 0.5)
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+            self.optimizer.zero_grad(set_to_none=True)
+        return total_loss / max(n, 1)
 
-                    # Backward pass
-                    loss.backward()
-
-                except Exception as e:
-                    logger.debug(f"Sample error: {e}")
-                    continue
-
-            # Update weights
-            if batch_samples > 0:
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-                self.optimizer.step()
-
-                batch_loss_avg = batch_loss_sum / batch_samples
-                total_loss += batch_loss_avg
-                num_samples += batch_samples
-                pbar.set_postfix({'loss': f'{batch_loss_avg:.4f}'})
-
-        avg_loss = total_loss / max(1, num_samples)
-        return avg_loss
-
-    def validate(self, val_data):
-        """Validate model"""
+    @torch.no_grad()
+    def evaluate(self, loader):
         self.model.eval()
-        total_loss = 0.0
-        predictions = []
-        targets = []
+        all_preds, all_targets = [], []
+        for mol_batch, prot_ids, targets in loader:
+            mol_batch = mol_batch.to(self.device)
+            prot_ids  = prot_ids.to(self.device)
+            preds = self.model(mol_batch, prot_ids).cpu().numpy().flatten()
+            all_preds.extend(self.normalizer.denormalize_array(preds))
+            all_targets.extend(self.normalizer.denormalize_array(targets.numpy().flatten()))
+        p, t = np.array(all_preds), np.array(all_targets)
+        # Guard against NaN/Inf from FP16 overflow corrupting predictions
+        if not np.isfinite(p).all():
+            print("  [WARN] Non-finite preds detected, returning sentinel metrics", flush=True)
+            return {'r2': -1e9, 'rmse': float('inf'), 'mae': float('inf'), 'ci': 0.0}
+        metrics = compute_metrics(p, t)
+        metrics['ci'] = concordance_index(p, t)
+        return metrics
 
-        with torch.no_grad():
-            for sample in val_data[:min(len(val_data), self.config.get('max_eval_samples', 2000))]:
-                try:
-                    smiles_ids = self.smiles_tokenizer.encode(sample['drug_smiles']).unsqueeze(0).to(self.device)
-                    protein_ids = self.protein_tokenizer.encode(sample['protein_sequence']).unsqueeze(0).to(self.device)
-
-                    pred = self.model(smiles_ids, protein_ids)
-                    normalized_target = self.normalizer.normalize(sample['affinity'])
-                    target = torch.tensor([[normalized_target]], dtype=torch.float32).to(self.device)
-
-                    loss = self.criterion(pred, target)
-                    total_loss += loss.item()
-                    # Denormalize for metrics calculation
-                    predictions.append(self.normalizer.denormalize(pred.cpu().item()))
-                    targets.append(sample['affinity'])
-
-                except Exception as e:
-                    logger.debug(f"Validation error: {e}")
-                    continue
-
-        if len(predictions) == 0:
-            return 0.0, 0.0, 0.0, 0.0
-
-        avg_loss = total_loss / len(predictions)
-        predictions = np.array(predictions)
-        targets = np.array(targets)
-
-        mse = mean_squared_error(targets, predictions)
-        mae = mean_absolute_error(targets, predictions)
-        r2 = r2_score(targets, predictions)
-
-        return avg_loss, mse, mae, r2
-
-    def train(self, train_data, val_data, test_data):
-        """Main training loop"""
-        logger.info(f"🚀 Starting Phase 4 Transfer Learning...")
-        logger.info(f"   Train samples: {len(train_data)}, Val: {len(val_data)}, Test: {len(test_data)}")
-
-        scheduler = OneCycleLR(
-            self.optimizer,
-            max_lr=self.config.get('learning_rate', 1e-4),
-            total_steps=self.config['epochs'],
-            pct_start=0.3,
-            anneal_strategy='cos'
+    def train(self, train_data, val_data, test_data) -> dict:
+        cfg = self.config
+        max_len = cfg.get('max_prot_len', 1200)
+        train_loader = build_dataloader(
+            train_data, batch_size=cfg.get('batch_size', 16),
+            shuffle=True,  normalizer=self.normalizer, balance=True,
+            max_prot_len=max_len,
+        )
+        val_loader = build_dataloader(
+            val_data, batch_size=cfg.get('batch_size', 16),
+            shuffle=False, normalizer=self.normalizer,
+            max_prot_len=max_len,
+        )
+        test_loader = build_dataloader(
+            test_data, batch_size=cfg.get('batch_size', 16),
+            shuffle=False, normalizer=self.normalizer,
+            max_prot_len=max_len,
         )
 
-        for epoch in range(self.config['epochs']):
-            start_time = time.time()
+        epochs = cfg.get('epochs', 30)
+        scheduler = CosineAnnealingWarmRestarts(
+            self.optimizer, T_0=10, T_mult=2, eta_min=1e-6
+        )
 
-            train_loss = self.train_epoch(train_data, epoch, self.config['epochs'])
-            val_loss, val_mse, val_mae, val_r2 = self.validate(val_data)
+        for epoch in range(epochs):
+            t0 = time.time()
+            self._warmup_lr(epoch)
+            tr_loss = self.train_epoch(train_loader, epoch)
+            val_m   = self.evaluate(val_loader)
+            if epoch >= self.warmup_epochs:
+                scheduler.step()
 
-            scheduler.step()
+            if val_m['r2'] > self.best_val_r2:
+                self.best_val_r2 = val_m['r2']
+                self.best_state  = {k: v.clone() for k, v in self.model.state_dict().items()}
 
-            self.train_losses.append(train_loss)
-            self.val_losses.append(val_loss)
-
-            if val_r2 > self.best_val_r2:
-                self.best_val_r2 = val_r2
-
-            epoch_time = time.time() - start_time
-            logger.info(
-                f"Epoch {epoch + 1}/{self.config['epochs']} ({epoch_time:.2f}s) | "
-                f"Train Loss: {train_loss:.6f} | Val Loss: {val_loss:.6f}, "
-                f"MSE: {val_mse:.4f}, MAE: {val_mae:.4f}, R²: {val_r2:.4f}"
+            print(
+                f"Epoch {epoch+1:3d}/{epochs} ({time.time()-t0:.0f}s) | "
+                f"Loss: {tr_loss:.4f} | "
+                f"Val  R2={val_m['r2']:.4f}  RMSE={val_m['rmse']:.4f}  CI={val_m['ci']:.4f}",
+                flush=True
             )
 
-        # Test evaluation
-        logger.info("🧪 Final test evaluation...")
-        test_loss, test_mse, test_mae, test_r2 = self.validate(test_data)
+        if self.best_state:
+            self.model.load_state_dict(self.best_state)
+        test_m = self.evaluate(test_loader)
+        print(f"Test  R2={test_m['r2']:.4f}  RMSE={test_m['rmse']:.4f}  CI={test_m['ci']:.4f}", flush=True)
+        return {'best_val_r2': self.best_val_r2, **{f'test_{k}': v for k, v in test_m.items()}}
 
-        logger.info(f"📊 Final Test Results:")
-        logger.info(f"   Loss: {test_loss:.6f}")
-        logger.info(f"   MSE: {test_mse:.4f}")
-        logger.info(f"   MAE: {test_mae:.4f}")
-        logger.info(f"   R²: {test_r2:.4f}")
+    def save_encoder(self, path: str):
+        """Save mol_encoder + prot_encoder weights for transfer to other phases."""
+        torch.save({
+            'mol_encoder':  self.model.mol_encoder.state_dict(),
+            'prot_encoder': self.model.prot_encoder.state_dict(),
+            'fusion':       self.model.fusion.state_dict(),
+        }, path)
+        print(f"Saved pretrained encoder to {path}", flush=True)
 
-        return {
-            'test_r2': test_r2,
-            'test_mse': test_mse,
-            'test_mae': test_mae,
-            'test_loss': test_loss,
-            'best_val_r2': self.best_val_r2
-        }
+    def load_encoder(self, path: str):
+        """Load pretrained encoder weights from a previous training run."""
+        ckpt = torch.load(path, map_location=self.device)
+        self.model.mol_encoder.load_state_dict(ckpt['mol_encoder'])
+        self.model.prot_encoder.load_state_dict(ckpt['prot_encoder'])
+        if 'fusion' in ckpt:
+            self.model.fusion.load_state_dict(ckpt['fusion'])
+        print(f"Loaded pretrained encoder from {path}", flush=True)
 
 
 # ============================================================================
-# MAIN EXECUTION
+# MAIN
 # ============================================================================
-
 def main():
     print("\n" + "=" * 80)
-    print("PHASE 4: TRANSFER LEARNING WITH PRE-TRAINED ENCODERS")
-    print("Using Simplified MolBERT + ProtBERT")
+    print("PHASE 4: JK-GIN - TRANSFER LEARNING (KIBA -> DAVIS)")
     print("=" * 80 + "\n")
 
-    # Load DAVIS dataset
-    logger.info("🔍 Loading DAVIS dataset...")
-    loader = DAVISDatasetLoader(data_dir="data")
-    davis_data = loader.load_davis()
-
-    if not davis_data:
-        logger.error("Failed to load DAVIS dataset")
-        return
-
-    logger.info(f"✅ Loaded {len(davis_data)} valid samples")
-
-    # Create splits
-    train_data, val_data, test_data = loader.create_splits(davis_data)
-
-    # Print statistics
-    stats = loader.get_statistics(davis_data)
-    logger.info(f"Dataset Statistics:")
-    logger.info(f"   Affinity: {stats['affinity_min']:.2f} - {stats['affinity_max']:.2f}")
-    logger.info(f"   Mean ± Std: {stats['affinity_mean']:.4f} ± {stats['affinity_std']:.4f}")
-
-    # Configuration
-    config = {
-        'epochs': 15,  # More epochs for transfer learning
-        'batch_size': 16,  # Larger batch size
-        'learning_rate': 1e-4,  # Lower learning rate for transfer learning
-        'weight_decay': 1e-5,
-        'freeze_encoders': False,  # Fine-tune encoders
-        'max_samples': 5000,
-        'max_eval_samples': 1000
+    # Shared model config (same hidden dims across both stages)
+    base_config = {
+        'batch_size':     12,
+        'accum_steps':    4,        # effective batch = 48
+        'lr':             8e-4,
+        'warmup_epochs':  3,
+        'weight_decay':   1e-4,
+        'gnn_hidden':     192,
+        'gnn_layers':     5,
+        'prot_embed':     128,
+        'prot_hidden':    192,
+        'prot_layers':    4,
+        'dropout':        0.1,
+        'max_prot_len':   1200,
+        'use_amp':        True,
     }
 
-    logger.info(f"Configuration:")
-    logger.info(f"   Epochs: {config['epochs']}")
-    logger.info(f"   Batch Size: {config['batch_size']}")
-    logger.info(f"   Learning Rate: {config['learning_rate']}")
-    logger.info(f"   Freeze Encoders: {config['freeze_encoders']}")
+    ckpt_path = Path(__file__).parent / "phase4_pretrained_encoder.pt"
 
-    # Create normalizer from stats
-    normalizer = AffinityNormalizer(mean=stats['affinity_mean'], std=stats['affinity_std'])
+    # ------------------------------------------------------------------
+    # STAGE 1: PRETRAIN on KIBA (~118k samples)
+    # ------------------------------------------------------------------
+    print("\n[STAGE 1] PRETRAIN on KIBA (~118k samples)\n", flush=True)
+    kiba_loader = KIBADatasetLoader(data_dir="data")
+    kiba_data   = kiba_loader.load_kiba()
+    kiba_stats  = kiba_loader.get_statistics(kiba_data)
+    k_train, k_val, k_test = kiba_loader.create_splits(kiba_data)
 
-    # Train
-    trainer = Phase4Trainer(config, normalizer=normalizer)
-    results = trainer.train(train_data, val_data, test_data)
+    kiba_normalizer = AffinityNormalizer(
+        mean=kiba_stats['affinity_mean'], std=kiba_stats['affinity_std'])
+    print(f"KIBA Normalizer: {kiba_normalizer.info()}", flush=True)
+
+    pretrain_cfg = {**base_config, 'epochs': 15}  # shorter pretrain — just learn general patterns
+    pretrainer = GINTrainer(pretrain_cfg, kiba_normalizer)
+    kiba_results = pretrainer.train(k_train, k_val, k_test)
+
+    print("\n--- KIBA PRETRAIN RESULTS ---", flush=True)
+    print(f"  Test R2={kiba_results['test_r2']:.4f}  "
+          f"RMSE={kiba_results['test_rmse']:.4f}  "
+          f"CI={kiba_results['test_ci']:.4f}", flush=True)
+
+    pretrainer.save_encoder(str(ckpt_path))
+
+    # ------------------------------------------------------------------
+    # STAGE 2: FINE-TUNE on DAVIS (~30k samples)
+    # ------------------------------------------------------------------
+    print("\n[STAGE 2] FINE-TUNE on DAVIS (~30k samples)\n", flush=True)
+    davis_loader = DAVISDatasetLoader(data_dir="data")
+    davis_data   = davis_loader.load_davis()
+    davis_stats  = davis_loader.get_statistics(davis_data)
+    d_train, d_val, d_test = davis_loader.create_splits(davis_data)
+
+    davis_normalizer = AffinityNormalizer(
+        mean=davis_stats['affinity_mean'], std=davis_stats['affinity_std'])
+    print(f"DAVIS Normalizer: {davis_normalizer.info()}", flush=True)
+
+    # Lower LR for fine-tuning (don't blow away pretrained features)
+    finetune_cfg = {**base_config, 'epochs': 50, 'lr': 3e-4, 'warmup_epochs': 2}
+    finetuner = GINTrainer(finetune_cfg, davis_normalizer)
+    finetuner.load_encoder(str(ckpt_path))
+    results = finetuner.train(d_train, d_val, d_test)
 
     print("\n" + "=" * 80)
-    print("🎉 PHASE 4 TRANSFER LEARNING COMPLETED!")
+    print("PHASE 4 RESULTS (TRANSFER LEARNING: KIBA -> DAVIS)")
     print("=" * 80)
-    print(f"✅ Final Test R²: {results['test_r2']:.4f}")
-    print(f"✅ Final Test MSE: {results['test_mse']:.4f}")
-    print(f"✅ Final Test MAE: {results['test_mae']:.4f}")
-    print(f"✅ Best Validation R²: {results['best_val_r2']:.4f}")
+    print(f"  KIBA pretrain Test R2 : {kiba_results['test_r2']:.4f}")
+    print(f"  DAVIS finetune Test R2: {results['test_r2']:.4f}")
+    print(f"  DAVIS finetune RMSE   : {results['test_rmse']:.4f}")
+    print(f"  DAVIS finetune MAE    : {results['test_mae']:.4f}")
+    print(f"  DAVIS finetune CI     : {results['test_ci']:.4f}")
     print("=" * 80 + "\n")
-
-    # Performance comparison
-    print("Performance Comparison:")
-    print(f"   Phase 2 Baseline R²: 0.5701")
-    print(f"   Phase 3 GNN R²: -0.0028")
-    print(f"   Phase 4 Transfer Learning R²: {results['test_r2']:.4f}")
-    if results['test_r2'] > 0.57:
-        print(f"   ✅ IMPROVEMENT: {(results['test_r2'] - 0.57) * 100:.1f}% over Phase 2!")
-    print()
 
 
 if __name__ == "__main__":

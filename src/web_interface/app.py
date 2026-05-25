@@ -45,12 +45,17 @@ except ImportError:
 import sys
 sys.path.append(str(Path(__file__).parent.parent))
 
-from models.deepdta_pro import DeepDTAPro
-from data.molecular_features import MolecularFeatureExtractor
-from data.protein_features import ProteinFeatureExtractor
-from interpretability.attention_visualization import AttentionVisualizer
-from interpretability.shap_analysis import DeepSHAPAnalyzer
-from interpretability.molecular_interpretation import MolecularInterpreter
+try:
+    from models.deepdta_pro import DeepDTAPro
+    from data.molecular_features import MolecularFeatureExtractor
+    from data.protein_features import ProteinFeatureExtractor
+    from interpretability.attention_visualization import AttentionVisualizer
+    from interpretability.shap_analysis import DeepSHAPAnalyzer
+    from interpretability.molecular_interpretation import MolecularInterpreter
+    MODELS_AVAILABLE = True
+except ImportError as e:
+    MODELS_AVAILABLE = False
+    logger.warning(f"Model imports failed: {e}. Running in demo mode.")
 
 # Page configuration
 st.set_page_config(
