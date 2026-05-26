@@ -419,6 +419,90 @@ def ss_predict(seq: str) -> List[str]:
     return smooth
 
 
+def enumerate_tautomers(smiles: str, max_taut: int = 8) -> List[str]:
+    """Return up to max_taut canonical tautomer SMILES using RDKit TautomerEnumerator."""
+    if not RDKIT_AVAILABLE:
+        return [smiles]
+    try:
+        from rdkit.Chem.MolStandardize import rdMolStandardize
+        enumerator = rdMolStandardize.TautomerEnumerator()
+        mol = Chem.MolFromSmiles(smiles)
+        if mol is None:
+            return [smiles]
+        tauts = enumerator.Enumerate(mol)
+        seen, result = set(), []
+        for t in tauts:
+            smi = Chem.MolToSmiles(t)
+            if smi not in seen:
+                seen.add(smi)
+                result.append(smi)
+            if len(result) >= max_taut:
+                break
+        return result if result else [smiles]
+    except Exception:
+        return [smiles]
+
+
+def enumerate_stereo(smiles: str, max_iso: int = 8) -> List[str]:
+    """Enumerate stereoisomers up to max_iso using RDKit EnumerateStereoisomers."""
+    if not RDKIT_AVAILABLE:
+        return [smiles]
+    try:
+        from rdkit.Chem.EnumerateStereoisomers import EnumerateStereoisomers, StereoEnumerationOptions
+        mol = Chem.MolFromSmiles(smiles)
+        if mol is None:
+            return [smiles]
+        opts = StereoEnumerationOptions(unique=True, maxIsomers=max_iso)
+        isomers = list(EnumerateStereoisomers(mol, options=opts))
+        return [Chem.MolToSmiles(m) for m in isomers] or [smiles]
+    except Exception:
+        return [smiles]
+
+
+def generate_analogues(smiles: str) -> List[Dict]:
+    """Rule-based R-group swap suggestions: halogen bioisostere, methyl addition,
+    OH→F, CN addition, CH3→CF3. Returns list of {name, smiles} dicts."""
+    if not RDKIT_AVAILABLE:
+        return []
+    results = []
+    rules = [
+        ("Cl→F (fluorine bioisostere)",   lambda s: s.replace("Cl","F",  1)),
+        ("Br→Cl (halogen walk)",           lambda s: s.replace("Br","Cl", 1)),
+        ("OH→F  (metabolic stability)",    lambda s: s.replace("O","F",   1)),
+        ("Add −CH₃ to N (N-methylation)",  lambda s: s.replace("N(","N(C",1) if "N(" in s else s.replace("[NH]","[N](C)",1)),
+        ("CH₃→CF₃ (fluorination)",         lambda s: s.replace("CC","C(F)(F)(F)",1) if "CC" in s else s),
+        ("Add −CN (nitrile)",              lambda s: s.replace("c1","c1C#N",1) if "c1" in s else s),
+        ("Add −OH (hydroxylation)",        lambda s: s.replace("c1","c1O", 1) if "c1" in s else s),
+        ("NH₂→NMe₂ (dimethylation)",       lambda s: s.replace("N","N(C)C",1) if "N" in s else s),
+    ]
+    for name, fn in rules:
+        try:
+            new_smi = fn(smiles)
+            if new_smi == smiles:
+                continue
+            mol = Chem.MolFromSmiles(new_smi)
+            if mol is not None:
+                canonical = Chem.MolToSmiles(mol)
+                if canonical != Chem.MolToSmiles(Chem.MolFromSmiles(smiles)):
+                    results.append({"Modification": name, "SMILES": canonical})
+        except Exception:
+            continue
+    return results
+
+
+def fetch_pdb_sequence(uniprot_id: str) -> str:
+    """Fetch canonical FASTA sequence from UniProt REST API."""
+    import urllib.request, urllib.error
+    url = f"https://rest.uniprot.org/uniprotkb/{uniprot_id.strip().upper()}.fasta"
+    try:
+        with urllib.request.urlopen(url, timeout=8) as r:
+            fasta = r.read().decode()
+        lines = [l for l in fasta.splitlines() if not l.startswith(">")]
+        return "".join(lines).strip().upper()
+    except Exception as e:
+        return ""
+
+
 def scaffold_info(smiles: str):
     if not RDKIT_AVAILABLE:
         return None, None
@@ -683,9 +767,10 @@ def page_single(p5, norm, mb, p6, p7):
     st.markdown("---")
     st.markdown("### 🔬 Molecular Analysis")
 
-    t2d,t3d,tgraph,tpharm,tscaf,tconf,tprops,tfp,tprot = st.tabs([
+    t2d,t3d,tgraph,tpharm,tscaf,tconf,tprops,tfp,tprot,ttaut,tlead,tpdb,tmut = st.tabs([
         "2D Structure","3D Interactive","Mol Graph","Pharmacophore",
-        "Scaffold","Conformers","Properties & ADMET","Fingerprint","Protein"
+        "Scaffold","Conformers","Properties & ADMET","Fingerprint","Protein",
+        "Tautomers & Stereo","Lead Optimization","PDB Fetcher","Mutation Impact",
     ])
 
     with t2d:
@@ -837,7 +922,7 @@ def page_single(p5, norm, mb, p6, p7):
             def color_risk(val):
                 return ("color:red;font-weight:bold" if val=="High" else
                         "color:orange" if val=="Medium" else "color:green")
-            st.dataframe(tox_df.style.applymap(color_risk, subset=["Risk"]),
+            st.dataframe(tox_df.style.map(color_risk, subset=["Risk"]),
                          use_container_width=True, hide_index=True)
 
             st.markdown("#### ADMET Radar")
@@ -949,6 +1034,193 @@ def page_single(p5, norm, mb, p6, p7):
             fig_sel.update_layout(height=320)
             st.plotly_chart(fig_sel, use_container_width=True)
             st.dataframe(sel_df, use_container_width=True, hide_index=True)
+
+    with ttaut:
+        st.markdown("#### Tautomer & Stereoisomer Explorer")
+        if RDKIT_AVAILABLE and mol:
+            tc1, tc2 = st.columns(2)
+            with tc1:
+                st.markdown("**Tautomers** — same molecular formula, different bond arrangement")
+                tauts = enumerate_tautomers(smiles)
+                st.caption(f"{len(tauts)} tautomer(s) found")
+                taut_rows = []
+                prog_t = st.progress(0)
+                for ti, tsmi in enumerate(tauts):
+                    try:
+                        r = predict_p5(tsmi, protein, p5, norm, mb)
+                        taut_rows.append({"SMILES": tsmi[:40]+"…" if len(tsmi)>40 else tsmi,
+                                          "pKd": round(r["pkd"], 3),
+                                          "Conf": round(r["confidence"], 3)})
+                    except Exception:
+                        taut_rows.append({"SMILES": tsmi[:40], "pKd": None, "Conf": None})
+                    prog_t.progress((ti+1)/len(tauts))
+                tdf = pd.DataFrame(taut_rows).sort_values("pKd", ascending=False, na_position="last")
+                st.dataframe(tdf, use_container_width=True, hide_index=True)
+                if len(tauts) > 1:
+                    best_t = tdf.dropna(subset=["pKd"]).iloc[0]
+                    orig_pkd = predict_p5(smiles, protein, p5, norm, mb)["pkd"]
+                    delta = best_t["pKd"] - orig_pkd
+                    if delta > 0.05:
+                        st.success(f"Best tautomer improves pKd by +{delta:.3f}")
+                    else:
+                        st.info("Original tautomer is already optimal.")
+            with tc2:
+                st.markdown("**Stereoisomers** — same connectivity, different 3D arrangement")
+                isos = enumerate_stereo(smiles)
+                st.caption(f"{len(isos)} stereoisomer(s) found")
+                iso_rows = []
+                prog_s = st.progress(0)
+                for si, ismi in enumerate(isos):
+                    try:
+                        r = predict_p5(ismi, protein, p5, norm, mb)
+                        iso_rows.append({"SMILES": ismi[:40]+"…" if len(ismi)>40 else ismi,
+                                         "pKd": round(r["pkd"], 3),
+                                         "Conf": round(r["confidence"], 3)})
+                    except Exception:
+                        iso_rows.append({"SMILES": ismi[:40], "pKd": None, "Conf": None})
+                    prog_s.progress((si+1)/len(isos))
+                idf = pd.DataFrame(iso_rows).sort_values("pKd", ascending=False, na_position="last")
+                st.dataframe(idf, use_container_width=True, hide_index=True)
+                if len(isos) > 1:
+                    figs = px.bar(idf.dropna(subset=["pKd"]),
+                                  x=[f"Iso {i+1}" for i in range(len(idf.dropna(subset=["pKd"])))],
+                                  y="pKd", color="pKd", color_continuous_scale="RdYlGn",
+                                  title="Stereoisomer pKd Ranking")
+                    figs.update_layout(height=260, margin=dict(l=10,r=10,t=40,b=10))
+                    st.plotly_chart(figs, use_container_width=True)
+        else:
+            st.info("RDKit required.")
+
+    with tlead:
+        st.markdown("#### Lead Optimization Suggester")
+        st.markdown("Rule-based R-group swaps that may improve binding affinity.")
+        if RDKIT_AVAILABLE and mol:
+            if st.button("Generate Analogues", key="lead_btn"):
+                analogues = generate_analogues(smiles)
+                if not analogues:
+                    st.warning("No valid analogues generated for this scaffold.")
+                else:
+                    orig_pkd = predict_p5(smiles, protein, p5, norm, mb)["pkd"]
+                    rows = []
+                    prog_l = st.progress(0)
+                    for li, a in enumerate(analogues):
+                        try:
+                            r = predict_p5(a["SMILES"], protein, p5, norm, mb)
+                            delta = r["pkd"] - orig_pkd
+                            rows.append({
+                                "Modification": a["Modification"],
+                                "SMILES": a["SMILES"],
+                                "pKd": round(r["pkd"], 3),
+                                "Δ pKd": round(delta, 3),
+                                "Verdict": "▲ Better" if delta > 0.05 else ("▼ Worse" if delta < -0.05 else "~ Same"),
+                            })
+                        except Exception:
+                            pass
+                        prog_l.progress((li+1)/len(analogues))
+                    ldf = pd.DataFrame(rows).sort_values("Δ pKd", ascending=False)
+                    st.dataframe(ldf, use_container_width=True, hide_index=True)
+                    better = ldf[ldf["Δ pKd"] > 0.05]
+                    if not better.empty:
+                        st.success(f"Found {len(better)} analogue(s) with improved affinity:")
+                        for _, row in better.iterrows():
+                            st.markdown(f"- **{row['Modification']}** → `{row['SMILES']}` "
+                                        f"(pKd={row['pKd']:.3f}, Δ={row['Δ pKd']:+.3f})")
+                    else:
+                        st.info("No analogues outperform the parent molecule on this target.")
+                    figl = go.Figure(go.Bar(
+                        x=ldf["Modification"], y=ldf["Δ pKd"],
+                        marker_color=["#2ecc71" if v>0.05 else ("#e74c3c" if v<-0.05 else "#95a5a6")
+                                      for v in ldf["Δ pKd"]],
+                        text=ldf["Δ pKd"].round(3), textposition="outside"))
+                    figl.add_hline(y=0, line_dash="dash", line_color="white")
+                    figl.update_layout(title="Δ pKd vs Parent Molecule",
+                                       xaxis_tickangle=-35, height=360,
+                                       margin=dict(l=10,r=10,t=50,b=80))
+                    st.plotly_chart(figl, use_container_width=True)
+        else:
+            st.info("RDKit required.")
+
+    with tpdb:
+        st.markdown("#### PDB / UniProt Protein Fetcher")
+        st.markdown("Fetch a protein sequence directly from UniProt and run prediction.")
+        upid = st.text_input("UniProt Accession ID (e.g. P00533 for EGFR)", key="uniprot_id")
+        if st.button("Fetch & Predict", key="pdb_btn") and upid.strip():
+            with st.spinner(f"Fetching {upid.strip().upper()} from UniProt…"):
+                fetched_seq = fetch_pdb_sequence(upid)
+            if not fetched_seq:
+                st.error("Could not fetch sequence. Check the UniProt ID and internet connection.")
+            else:
+                st.success(f"Fetched sequence: {len(fetched_seq)} residues")
+                st.code(fetched_seq[:120] + ("…" if len(fetched_seq)>120 else ""), language=None)
+                try:
+                    r_pdb = predict_p5(smiles, fetched_seq, p5, norm, mb)
+                    r_orig = predict_p5(smiles, protein, p5, norm, mb)
+                    pc1, pc2 = st.columns(2)
+                    pc1.metric(f"pKd vs {upid.strip().upper()}", f"{r_pdb['pkd']:.3f}")
+                    pc2.metric("pKd vs original protein", f"{r_orig['pkd']:.3f}",
+                               delta=f"{r_pdb['pkd']-r_orig['pkd']:+.3f}")
+                    if PY3DMOL_AVAILABLE and RDKIT_AVAILABLE and mol:
+                        st.markdown("**Drug 3D structure** (protein structure requires AlphaFold/PDB download):")
+                        html3d = mol_3d_html(smiles)
+                        if html3d:
+                            components.html(html3d, height=380)
+                except Exception as e:
+                    st.error(f"Prediction failed: {e}")
+
+    with tmut:
+        st.markdown("#### Protein Mutation Impact")
+        st.markdown("Simulate a point mutation and compare predicted binding affinity.")
+        m1, m2 = st.columns(2)
+        with m1:
+            pos = st.number_input("Position (1-based)", min_value=1,
+                                   max_value=len(protein) if protein else 9999,
+                                   value=min(10, len(protein)) if protein else 10,
+                                   step=1, key="mut_pos")
+        with m2:
+            new_aa = st.selectbox("Mutant amino acid",
+                                  list("ACDEFGHIKLMNPQRSTVWY"), key="mut_aa")
+        if st.button("Compute Mutation Impact", key="mut_btn") and protein:
+            pos_idx = int(pos) - 1
+            wt_aa = protein[pos_idx] if pos_idx < len(protein) else "?"
+            if wt_aa == new_aa:
+                st.warning("Mutant is identical to wild-type at this position.")
+            else:
+                mut_seq = protein[:pos_idx] + new_aa + protein[pos_idx+1:]
+                with st.spinner("Predicting wild-type and mutant affinity…"):
+                    try:
+                        r_wt  = predict_p5(smiles, protein,  p5, norm, mb)
+                        r_mut = predict_p5(smiles, mut_seq, p5, norm, mb)
+                        delta_mut = r_mut["pkd"] - r_wt["pkd"]
+                        mu1, mu2, mu3 = st.columns(3)
+                        mu1.metric("Wild-type pKd",  f"{r_wt['pkd']:.3f}")
+                        mu2.metric("Mutant pKd",     f"{r_mut['pkd']:.3f}",
+                                   delta=f"{delta_mut:+.3f}")
+                        mu3.metric("Mutation",       f"{wt_aa}{int(pos)}{new_aa}")
+                        impact = "Resistance" if delta_mut < -0.2 else \
+                                 ("Sensitizing" if delta_mut > 0.2 else "Neutral")
+                        col_map = {"Resistance":"bad","Sensitizing":"good","Neutral":"info"}
+                        st.markdown(f'<span class="badge {col_map[impact]}">Impact: {impact}</span>',
+                                    unsafe_allow_html=True)
+                        fig_mut = go.Figure(go.Bar(
+                            x=["Wild-type", f"Mutant {wt_aa}{int(pos)}{new_aa}"],
+                            y=[r_wt["pkd"], r_mut["pkd"]],
+                            marker_color=["#3498db",
+                                          "#2ecc71" if delta_mut>0.2 else
+                                          ("#e74c3c" if delta_mut<-0.2 else "#95a5a6")],
+                            text=[f"{r_wt['pkd']:.3f}", f"{r_mut['pkd']:.3f}"],
+                            textposition="outside"))
+                        fig_mut.add_hline(y=7.0, line_dash="dash", line_color="red",
+                                          annotation_text="Strong binder")
+                        fig_mut.update_layout(height=320, yaxis_title="pKd",
+                                              margin=dict(t=40,b=20))
+                        st.plotly_chart(fig_mut, use_container_width=True)
+                        st.caption(f"Mutation {wt_aa}{int(pos)}{new_aa}: "
+                                   f"{'reduces' if delta_mut<0 else 'increases'} binding by "
+                                   f"{abs(delta_mut):.3f} pKd units")
+                    except Exception as e:
+                        st.error(f"Prediction failed: {e}")
+        elif not protein:
+            st.info("Enter a protein sequence first.")
 
     # ── PDF export ────────────────────────────────────────────────────────────
     st.markdown("---")
