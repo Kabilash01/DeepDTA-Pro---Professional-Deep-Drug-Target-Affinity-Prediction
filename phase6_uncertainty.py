@@ -186,9 +186,26 @@ class BayesianGNNTrainer:
                 pg['lr'] = self.base_lr * scale
 
     def load_pretrained(self, path: str):
-        """Load Phase 4 pretrained weights — transfer prot_encoder only (fusion dim mismatch)."""
+        """Load pretrained weights. Phase 5 checkpoint has matching architecture (full transfer).
+        Falls back to prot_encoder-only transfer for Phase 4 checkpoint."""
         try:
             ckpt = torch.load(path, map_location=self.device)
+            # Phase 5 checkpoint: model_state_dict with full architecture match
+            if 'model_state_dict' in ckpt and 'prot_encoder' not in ckpt:
+                state = ckpt['model_state_dict']
+                # Strip multi-task heads (affinity_head → head rename)
+                bayesian_state = {}
+                for k, v in state.items():
+                    if k.startswith('affinity_head.'):
+                        bayesian_state[k.replace('affinity_head.', 'head.')] = v
+                    elif not k.startswith('efficiency_head.') and not k.startswith('selectivity_head.') \
+                         and not k.startswith('log_var'):
+                        bayesian_state[k] = v
+                missing, unexpected = self.model.load_state_dict(bayesian_state, strict=False)
+                print(f"Phase 5 warm-start: {len(bayesian_state)} tensors loaded, "
+                      f"missing={len(missing)}, unexpected={len(unexpected)}", flush=True)
+                return
+            # Phase 4 checkpoint: prot_encoder key only
             loaded = []
             try:
                 self.model.prot_encoder.load_state_dict(ckpt['prot_encoder'], strict=False)
@@ -301,6 +318,12 @@ class BayesianGNNTrainer:
                 self.best_val_r2 = val_m['r2']
                 self.best_state  = {k: v.clone() for k, v in self.model.state_dict().items()}
 
+                # Save checkpoint immediately when better model is found
+                ckpt_path = Path(__file__).parent / 'models' / 'checkpoints' / 'phase6_best_model.pth'
+                ckpt_path.parent.mkdir(parents=True, exist_ok=True)
+                torch.save({'model_state_dict': self.best_state}, ckpt_path)
+                print(f"  → Best model saved at epoch {epoch+1} (R²={self.best_val_r2:.4f})", flush=True)
+
             print(
                 f"Epoch {epoch+1:3d}/{epochs} ({time.time()-t0:.0f}s) | "
                 f"Loss: {tr_loss:.4f} | "
@@ -319,6 +342,19 @@ class BayesianGNNTrainer:
             f"Epistemic Unc={test_m.get('mean_epistemic_unc', 0):.4f}",
             flush=True
         )
+
+        # Save checkpoint
+        checkpoint_path = Path(__file__).parent / 'models' / 'checkpoints' / 'phase6_best_model.pth'
+        checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save({
+            'model_state_dict': self.best_state if self.best_state else self.model.state_dict(),
+            'epoch': self.config.get('epochs', 40),
+            'best_val_r2': self.best_val_r2,
+            'test_metrics': test_m,
+            'config': self.config,
+        }, checkpoint_path)
+        print(f"Checkpoint saved to {checkpoint_path}", flush=True)
+
         return {'best_val_r2': self.best_val_r2, **{f'test_{k}': v for k, v in test_m.items()}}
 
 
@@ -357,9 +393,14 @@ def main():
     }
 
     trainer = BayesianGNNTrainer(config, normalizer)
-    pretrained_ckpt = Path(__file__).parent / "phase4_pretrained_encoder.pt"
-    if pretrained_ckpt.exists():
-        trainer.load_pretrained(str(pretrained_ckpt))
+    # Prefer Phase 5 checkpoint (same architecture = full transfer), fall back to Phase 4
+    phase5_ckpt = Path(__file__).parent / "models" / "checkpoints" / "phase5_best_model.pth"
+    phase4_ckpt = Path(__file__).parent / "phase4_pretrained_encoder.pt"
+    if phase5_ckpt.exists():
+        print(f"Loading Phase 5 checkpoint for warm-start: {phase5_ckpt}", flush=True)
+        trainer.load_pretrained(str(phase5_ckpt))
+    elif phase4_ckpt.exists():
+        trainer.load_pretrained(str(phase4_ckpt))
     results = trainer.train(train, val, test)
 
     print("\n" + "=" * 80)

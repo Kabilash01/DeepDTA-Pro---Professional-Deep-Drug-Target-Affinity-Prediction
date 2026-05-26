@@ -302,6 +302,7 @@ class MultiTaskGNNTrainer:
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
                 self.optimizer.zero_grad(set_to_none=True)
+                torch.cuda.empty_cache()  # Clear VRAM cache
                 pending = False
 
             total_loss += loss.item() * self.accum_steps * t_aff.size(0)
@@ -362,6 +363,12 @@ class MultiTaskGNNTrainer:
                 self.best_val_r2 = val_m['r2']
                 self.best_state  = {k: v.clone() for k, v in self.model.state_dict().items()}
 
+                # Save checkpoint immediately when better model is found
+                ckpt_path = Path(__file__).parent / 'models' / 'checkpoints' / 'phase5_best_model.pth'
+                ckpt_path.parent.mkdir(parents=True, exist_ok=True)
+                torch.save({'model_state_dict': self.best_state}, ckpt_path)
+                print(f"  → Best model saved at epoch {epoch+1} (R²={self.best_val_r2:.4f})", flush=True)
+
             print(
                 f"Epoch {epoch+1:3d}/{epochs} ({time.time()-t0:.0f}s) | "
                 f"Loss: {tr_loss:.4f} | "
@@ -373,6 +380,19 @@ class MultiTaskGNNTrainer:
             self.model.load_state_dict(self.best_state)
         test_m = self.evaluate(test_loader)
         print(f"Test  R²={test_m['r2']:.4f}  RMSE={test_m['rmse']:.4f}  CI={test_m['ci']:.4f}", flush=True)
+
+        # Save checkpoint
+        checkpoint_path = Path(__file__).parent / 'models' / 'checkpoints' / 'phase5_best_model.pth'
+        checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save({
+            'model_state_dict': self.best_state if self.best_state else self.model.state_dict(),
+            'epoch': epochs,
+            'best_val_r2': self.best_val_r2,
+            'test_metrics': test_m,
+            'config': self.config,
+        }, checkpoint_path)
+        print(f"Checkpoint saved to {checkpoint_path}", flush=True)
+
         return {'best_val_r2': self.best_val_r2, **{f'test_{k}': v for k, v in test_m.items()}}
 
 

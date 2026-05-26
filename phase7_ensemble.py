@@ -62,16 +62,32 @@ def train_single_model(gnn_type: str, config: dict, normalizer: AffinityNormaliz
         bond_cnn_dim = config.get('bond_cnn_dim', 32),
     ).to(device)
 
-    # Load pretrained prot_encoder from Phase 4 (fusion dim differs — skip it)
+    # Warm-start: Phase 5 checkpoint has matching architecture (full transfer).
+    # Fall back to Phase 4 prot_encoder-only transfer if Phase 5 not available.
     pretrained_path = config.get('pretrained_path', None)
     if pretrained_path and Path(pretrained_path).exists():
         try:
             ckpt = torch.load(pretrained_path, map_location=device)
-            try:
-                model.prot_encoder.load_state_dict(ckpt['prot_encoder'], strict=False)
-                print(f"  [{gnn_type.upper()} s={seed}] Loaded prot_encoder (partial)", flush=True)
-            except Exception:
-                pass
+            if 'model_state_dict' in ckpt and 'prot_encoder' not in ckpt:
+                # Phase 5 checkpoint — full model weights, strip multi-task heads
+                state = ckpt['model_state_dict']
+                transfer_state = {}
+                for k, v in state.items():
+                    if k.startswith('affinity_head.'):
+                        transfer_state[k.replace('affinity_head.', 'head.')] = v
+                    elif not k.startswith('efficiency_head.') and not k.startswith('selectivity_head.') \
+                         and not k.startswith('log_var'):
+                        transfer_state[k] = v
+                missing, unexpected = model.load_state_dict(transfer_state, strict=False)
+                print(f"  [{gnn_type.upper()} s={seed}] Phase 5 warm-start: "
+                      f"{len(transfer_state)} tensors, missing={len(missing)}", flush=True)
+            else:
+                # Phase 4 checkpoint — prot_encoder only
+                try:
+                    model.prot_encoder.load_state_dict(ckpt['prot_encoder'], strict=False)
+                    print(f"  [{gnn_type.upper()} s={seed}] Loaded prot_encoder (partial)", flush=True)
+                except Exception:
+                    pass
         except Exception as e:
             print(f"  [{gnn_type.upper()} s={seed}] Pretrained load skipped: {e}", flush=True)
 
@@ -331,6 +347,17 @@ class EnsembleTrainer:
         metrics.update(div)
         metrics['member_val_r2s'] = member_val_r2s
 
+        # Save checkpoint
+        checkpoint_path = Path(__file__).parent / 'models' / 'checkpoints' / 'phase7_ensemble_best_model.pth'
+        checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save({
+            'ensemble_members': [m.state_dict() for m in trained_members],
+            'member_specs': member_specs,
+            'test_metrics': metrics,
+            'config': self.config,
+        }, checkpoint_path)
+        print(f"Ensemble checkpoint saved to {checkpoint_path}", flush=True)
+
         return metrics
 
 
@@ -367,7 +394,12 @@ def main():
         'bond_cnn_dim':   32,
         'max_prot_len':   1200,
         'use_amp':        True,
-        'pretrained_path': str(Path(__file__).parent / "phase4_pretrained_encoder.pt"),
+        # Prefer Phase 5 checkpoint (same architecture = full transfer)
+        'pretrained_path': str(
+            Path(__file__).parent / "models" / "checkpoints" / "phase5_best_model.pth"
+            if (Path(__file__).parent / "models" / "checkpoints" / "phase5_best_model.pth").exists()
+            else Path(__file__).parent / "phase4_pretrained_encoder.pt"
+        ),
     }
 
     trainer = EnsembleTrainer(config, normalizer)

@@ -508,6 +508,7 @@ class BondCNNEncoder(nn.Module):
         # scatter mean: for each atom, average its outgoing bond contexts
         out   = torch.zeros(n_atoms, self.out_dim, dtype=torch.float32, device=x.device)
         count = torch.zeros(n_atoms, 1,             dtype=torch.float32, device=x.device)
+        bond_ctx = bond_ctx.to(out.dtype)  # Ensure same dtype for scatter_add_
         out.scatter_add_(0, src.unsqueeze(1).expand_as(bond_ctx), bond_ctx)
         count.scatter_add_(0, src.unsqueeze(1), torch.ones(src.size(0), 1, dtype=torch.float32, device=x.device))
         count.clamp_(min=1.0)
