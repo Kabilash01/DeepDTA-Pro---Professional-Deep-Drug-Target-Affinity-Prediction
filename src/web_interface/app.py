@@ -27,7 +27,8 @@ logger = logging.getLogger(__name__)
 try:
     from rdkit import Chem
     from rdkit.Chem import (Draw, Descriptors, AllChem, rdMolDescriptors,
-                             DataStructs, rdFingerprintGenerator, MurckoScaffold)
+                             DataStructs, rdFingerprintGenerator)
+    from rdkit.Chem.Scaffolds import MurckoScaffold
     from rdkit.Chem.Draw import rdMolDraw2D
     from rdkit.Chem import rdDepictor
     RDKIT_AVAILABLE = True
@@ -78,15 +79,31 @@ st.markdown("""
 <style>
 .main-header{font-size:2.5rem;color:#1f77b4;text-align:center;font-weight:700;margin-bottom:.3rem}
 .sub-header{font-size:1.4rem;color:#ff7f0e;font-weight:600;margin:.6rem 0 .3rem}
-.pred-box{background:linear-gradient(135deg,#667eea,#764ba2);color:#fff;
-  padding:1.6rem;border-radius:1rem;text-align:center;margin:.8rem 0}
-.pred-box h1{font-size:2.8rem;margin:.2rem 0}
-.pred-box p{font-size:.95rem;opacity:.9;margin:0}
-.badge{display:inline-block;padding:.2rem .7rem;border-radius:1rem;font-size:.82rem;font-weight:600;margin:.1rem}
-.good{background:#d4edda;color:#155724}.warn{background:#fff3cd;color:#856404}
-.bad{background:#f8d7da;color:#721c24}.info{background:#d1ecf1;color:#0c5460}
-.ci-box{background:#f8f9fa;border-left:4px solid #1f77b4;padding:.8rem 1rem;
-  border-radius:.3rem;margin:.5rem 0;font-family:monospace;font-size:.88rem}
+.pred-box{background:linear-gradient(135deg,#1a73e8,#0d47a1);color:#fff;
+  padding:1.6rem;border-radius:1rem;text-align:center;margin:.8rem 0;
+  box-shadow:0 4px 14px rgba(26,115,232,0.35)}
+.pred-box h1{font-size:2.8rem;margin:.2rem 0;font-weight:800;letter-spacing:.5px}
+.pred-box p{font-size:.95rem;opacity:.85;margin:0}
+.badge{display:inline-block;padding:.25rem .75rem;border-radius:1rem;
+  font-size:.82rem;font-weight:700;margin:.1rem;letter-spacing:.3px}
+.good{background:#e6f4ea;color:#1e7e34;border:1px solid #a8d5b5}
+.warn{background:#fff8e1;color:#b45309;border:1px solid #fcd34d}
+.bad{background:#fde8e8;color:#b91c1c;border:1px solid #fca5a5}
+.info{background:#e0f2fe;color:#0369a1;border:1px solid #7dd3fc}
+.ci-box{
+  background:linear-gradient(135deg,#0f172a,#1e293b);
+  color:#e2e8f0;
+  border-left:4px solid #38bdf8;
+  padding:1rem 1.2rem;
+  border-radius:.5rem;
+  margin:.6rem 0;
+  font-family:'Courier New',monospace;
+  font-size:.87rem;
+  line-height:1.8;
+  box-shadow:0 2px 8px rgba(0,0,0,0.3)
+}
+.ci-box b{color:#7dd3fc}
+.ci-title{color:#38bdf8;font-size:.92rem;font-weight:700;letter-spacing:.5px}
 </style>
 """, unsafe_allow_html=True)
 
@@ -546,15 +563,30 @@ def page_single(p5, norm, mb, p6, p7):
     col1, col2 = st.columns(2)
     with col1:
         st.markdown("#### 💊 Drug SMILES")
-        smiles  = st.text_area("smiles", DEFAULT_SMILES, height=85, label_visibility="collapsed")
-        mol     = Chem.MolFromSmiles(smiles) if RDKIT_AVAILABLE and smiles else None
+        smiles_raw = st.text_area("smiles", DEFAULT_SMILES, height=85, label_visibility="collapsed")
+        smiles = smiles_raw.strip().strip('"').strip("'").replace("\n","").replace("\r","").replace(" ","")
+        mol = Chem.MolFromSmiles(smiles) if RDKIT_AVAILABLE and smiles else None
+        if not RDKIT_AVAILABLE and smiles:
+            mol = True  # can't validate without RDKit — allow through
         if smiles:
-            badge = "good" if mol else "bad"
-            label = "✓ Valid SMILES" if mol else "✗ Invalid SMILES"
-            st.markdown(f'<span class="badge {badge}">{label}</span>', unsafe_allow_html=True)
+            if not RDKIT_AVAILABLE:
+                st.markdown('<span class="badge info">⚠ RDKit unavailable — cannot validate</span>', unsafe_allow_html=True)
+            else:
+                badge = "good" if mol else "bad"
+                label = "✓ Valid SMILES" if mol else "✗ Invalid SMILES — check for typos or unsupported notation"
+                st.markdown(f'<span class="badge {badge}">{label}</span>', unsafe_allow_html=True)
+                if not mol:
+                    with st.expander("Try these valid example SMILES"):
+                        st.code("Ibuprofen:   CC(C)CC1=CC=C(C=C1)C(C)C(=O)O\n"
+                                "Aspirin:     CC(=O)Oc1ccccc1C(=O)O\n"
+                                "Caffeine:    Cn1c(=O)c2c(ncn2C)n(c1=O)C\n"
+                                "Imatinib:    Cc1ccc(cc1Nc2nccc(n2)c3cccnc3)NC(=O)c4ccc(cc4)CN5CCN(CC5)C\n"
+                                "Erlotinib:   C#Cc1cccc(c1)Nc2ncnc3cc(c(cc23)OCCO)OCCO\n"
+                                "Gefitinib:   COc1cc2ncnc(Nc3ccc(F)c(Cl)c3)c2cc1OCCCN4CCOCC4")
     with col2:
         st.markdown("#### 🧬 Protein Sequence")
-        protein = st.text_area("prot", DEFAULT_PROT, height=85, label_visibility="collapsed")
+        protein_raw = st.text_area("prot", DEFAULT_PROT, height=85, label_visibility="collapsed")
+        protein = re.sub(r'[^A-Za-z]', '', protein_raw).upper()
         if protein:
             n = len(protein)
             b = "good" if n <= 1200 else "warn"
@@ -569,7 +601,7 @@ def page_single(p5, norm, mb, p6, p7):
         if not smiles or not protein:
             st.warning("Enter both inputs.")
         elif mol is None:
-            st.error("Invalid SMILES.")
+            st.error("Invalid SMILES. Use the examples above or paste a canonical SMILES string.")
         else:
             with st.spinner("Running predictions…"):
                 try:
@@ -614,12 +646,13 @@ def page_single(p5, norm, mb, p6, p7):
     if r6:
         tier_badge = {"High":"good","Medium":"warn","Low":"bad"}[r6["tier"]]
         tier_icon  = {"High":"🟢","Medium":"🟡","Low":"🔴"}[r6["tier"]]
+        tier_color = {"High":"#4ade80","Medium":"#fbbf24","Low":"#f87171"}[r6["tier"]]
         st.markdown(f"""<div class="ci-box">
-<b>MC Dropout Uncertainty (T=20 passes)</b><br>
-├── Point estimate (Phase 6): &nbsp; <b>{r6['mean']:.3f} pKd</b><br>
-├── Std deviation:             &nbsp; <b>± {r6['std']:.3f}</b><br>
-├── 95% CI:                    &nbsp; <b>[{r6['ci_lo']:.3f} – {r6['ci_hi']:.3f}]</b><br>
-└── Reliability: &nbsp; <span class="badge {tier_badge}">{tier_icon} {r6['tier']} confidence</span>
+<span class="ci-title">&#x25A0; MC Dropout Uncertainty &nbsp;(T=20 forward passes)</span><br><br>
+&nbsp; &#x251C;&#x2500; Point estimate &nbsp;<span style="color:#94a3b8">(Phase&nbsp;6)</span> &nbsp;&nbsp;&nbsp; <b>{r6['mean']:.3f} pKd</b><br>
+&nbsp; &#x251C;&#x2500; Std deviation &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; <b style="color:#fb923c">&#x00B1;&nbsp;{r6['std']:.3f}</b><br>
+&nbsp; &#x251C;&#x2500; 95% CI &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; <b>[{r6['ci_lo']:.3f} &ndash; {r6['ci_hi']:.3f}]</b><br>
+&nbsp; &#x2514;&#x2500; Reliability &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; <b style="color:{tier_color}">{tier_icon} {r6['tier']} confidence</b>
 </div>""", unsafe_allow_html=True)
 
     # ── phase-wise comparison ─────────────────────────────────────────────────
@@ -967,7 +1000,9 @@ def page_batch(p5, norm, mb):
     prog = st.progress(0); status = st.empty(); results = []
     for i, (_, row) in enumerate(df.iterrows()):
         try:
-            r = predict_p5(str(row["drug_smiles"]), str(row["protein_sequence"]), p5, norm, mb)
+            smi_clean  = str(row["drug_smiles"]).strip().strip('"').strip("'").replace(" ","")
+            prot_clean = re.sub(r'[^A-Za-z]', '', str(row["protein_sequence"])).upper()
+            r = predict_p5(smi_clean, prot_clean, p5, norm, mb)
             d = row.to_dict()
             d.update({"predicted_pKd": round(r["pkd"],4), "confidence": round(r["confidence"],4)})
         except Exception as e:
@@ -1030,7 +1065,8 @@ def page_comparison(p5, norm, mb):
     st.markdown('<h2 class="sub-header">🔁 Comparison Mode</h2>', unsafe_allow_html=True)
     st.markdown("Compare up to **5 drug molecules** against the same protein target.")
 
-    protein = st.text_area("Protein Sequence", DEFAULT_PROT, height=70)
+    protein_raw = st.text_area("Protein Sequence", DEFAULT_PROT, height=70)
+    protein = re.sub(r'[^A-Za-z]', '', protein_raw).upper()
     st.markdown("#### Drug Molecules")
 
     n_drugs = st.slider("Number of molecules", 2, 5, 3)
@@ -1040,7 +1076,8 @@ def page_comparison(p5, norm, mb):
         with col:
             smi  = st.text_input(f"SMILES {i+1}", DEFAULT_SMILES if i==0 else "", key=f"cmp_{i}")
             name = st.text_input(f"Name {i+1}", f"Drug {i+1}", key=f"cmpn_{i}")
-            smiles_list.append(smi); names_list.append(name)
+            smiles_list.append(smi.strip().replace(" ",""))
+            names_list.append(name)
 
     if not st.button("🔮 Compare All", use_container_width=True, type="primary"):
         return
@@ -1053,8 +1090,9 @@ def page_comparison(p5, norm, mb):
     prog = st.progress(0)
     for i,(smi,name) in enumerate(valid_smiles):
         mol = Chem.MolFromSmiles(smi) if RDKIT_AVAILABLE else None
-        if mol is None:
-            results.append({"Name":name,"SMILES":smi,"pKd":None,"Valid":False})
+        if RDKIT_AVAILABLE and mol is None:
+            results.append({"Name":name,"SMILES":smi,"pKd":None,"Valid":False,
+                            "Error":"Invalid SMILES"})
             continue
         try:
             r = predict_p5(smi, protein, p5, norm, mb)
