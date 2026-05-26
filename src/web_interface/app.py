@@ -630,12 +630,12 @@ def page_home():
             "R²":    [0.42,0.48,0.55,0.588,0.418,0.462],
             "RMSE":  [0.72,0.68,0.62,0.551,0.655,0.629],
         })
-        st.dataframe(df, use_container_width=True, hide_index=True)
+        st.dataframe(df, width='stretch', hide_index=True)
 
     if st.session_state.get("predictions"):
         st.markdown("### Recent Predictions")
         st.dataframe(pd.DataFrame(st.session_state["predictions"][-5:]),
-                     use_container_width=True, hide_index=True)
+                     width='stretch', hide_index=True)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -678,7 +678,7 @@ def page_single(p5, norm, mb, p6, p7):
 
     _, mid, _ = st.columns([1,2,1])
     with mid:
-        run = st.button("🔮 Predict Binding Affinity", use_container_width=True,
+        run = st.button("🔮 Predict Binding Affinity", width='stretch',
                         type="primary", disabled=(p5 is None))
 
     if run:
@@ -717,7 +717,7 @@ def page_single(p5, norm, mb, p6, p7):
           <p>Phase 5 — Primary Prediction</p><h1>{pkd:.3f}</h1><p>pKd</p></div>""",
           unsafe_allow_html=True)
     with c2:
-        st.plotly_chart(gauge_chart(pkd), use_container_width=True)
+        st.plotly_chart(gauge_chart(pkd), width='stretch')
     with c3:
         delta = pkd - 5.7512
         bclass = "good" if pkd>=7 else ("warn" if pkd>=5 else "bad")
@@ -761,7 +761,7 @@ def page_single(p5, norm, mb, p6, p7):
         fig.update_layout(height=max(250, len(pdf)*30+60),
                           xaxis_title="Predicted pKd",
                           margin=dict(l=10,r=20,t=20,b=10))
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width='stretch')
 
     # ── visualization tabs ────────────────────────────────────────────────────
     st.markdown("---")
@@ -806,7 +806,7 @@ def page_single(p5, norm, mb, p6, p7):
                     labels={n:G.nodes[n]["sym"] for n in G.nodes},
                     font_color="white", font_size=8, node_size=400,
                     edge_color="#aaa", width=1.5)
-            st.pyplot(fig, use_container_width=True); plt.close()
+            st.pyplot(fig, width='stretch'); plt.close()
         else:
             st.info("RDKit required.")
 
@@ -923,7 +923,7 @@ def page_single(p5, norm, mb, p6, p7):
                 return ("color:red;font-weight:bold" if val=="High" else
                         "color:orange" if val=="Medium" else "color:green")
             st.dataframe(tox_df.style.map(color_risk, subset=["Risk"]),
-                         use_container_width=True, hide_index=True)
+                         width='stretch', hide_index=True)
 
             st.markdown("#### ADMET Radar")
             cats = ["Absorption","Distribution","Metabolism","Excretion","Toxicity"]
@@ -944,7 +944,7 @@ def page_single(p5, norm, mb, p6, p7):
                 name="Reference"))
             fig.update_layout(polar=dict(radialaxis=dict(range=[0,1],showticklabels=False)),
                               height=320, margin=dict(l=40,r=40,t=30,b=20))
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width='stretch')
         else:
             st.info("RDKit required.")
 
@@ -956,14 +956,14 @@ def page_single(p5, norm, mb, p6, p7):
             ax.set_title("Morgan Fingerprint (radius=2, 128 bits)", fontsize=11)
             ax.set_xlabel("Bit (×16)"); ax.set_ylabel("Row (×8)")
             plt.colorbar(im, ax=ax, fraction=0.03)
-            st.pyplot(fig, use_container_width=True); plt.close()
+            st.pyplot(fig, width='stretch'); plt.close()
             st.caption(f"{int(bits.sum())}/128 bits set")
 
             # Similar compounds
             st.markdown("#### Similar Compounds in DAVIS")
             sim_df = tanimoto_search(smiles, top_n=5)
             if not sim_df.empty:
-                st.dataframe(sim_df, use_container_width=True, hide_index=True)
+                st.dataframe(sim_df, width='stretch', hide_index=True)
             else:
                 st.info("DAVIS index not available.")
         else:
@@ -983,7 +983,7 @@ def page_single(p5, norm, mb, p6, p7):
                 hole=0.35, marker_colors=["#e07b39","#4c78a8","#f58518","#72b7b2"]))
             fig.update_layout(height=260, margin=dict(l=5,r=5,t=30,b=5),
                               title="AA Composition")
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width='stretch')
 
         with bar_col:
             aa_df = pd.DataFrame(sorted(comp["counts"].items(),key=lambda x:-x[1]),
@@ -991,7 +991,7 @@ def page_single(p5, norm, mb, p6, p7):
             fig2 = px.bar(aa_df, x="AA", y="Count", color="Count",
                           color_continuous_scale="Blues", title="AA Frequency")
             fig2.update_layout(height=260, margin=dict(l=5,r=5,t=30,b=5))
-            st.plotly_chart(fig2, use_container_width=True)
+            st.plotly_chart(fig2, width='stretch')
 
         st.markdown("#### Secondary Structure Prediction")
         ss = ss_predict(protein[:200])
@@ -1009,7 +1009,7 @@ def page_single(p5, norm, mb, p6, p7):
             showscale=False))
         fig_ss.update_layout(height=80, margin=dict(l=5,r=5,t=10,b=5),
                              yaxis=dict(showticklabels=False))
-        st.plotly_chart(fig_ss, use_container_width=True)
+        st.plotly_chart(fig_ss, width='stretch')
         st.caption("Red=α-Helix · Blue=β-Sheet · Grey=Coil (Chou-Fasman inspired)")
 
         st.markdown("#### Protein Selectivity Profile")
@@ -1032,8 +1032,8 @@ def page_single(p5, norm, mb, p6, p7):
             fig_sel.add_hline(y=7.0, line_dash="dash", line_color="red",
                               annotation_text="Strong binder threshold")
             fig_sel.update_layout(height=320)
-            st.plotly_chart(fig_sel, use_container_width=True)
-            st.dataframe(sel_df, use_container_width=True, hide_index=True)
+            st.plotly_chart(fig_sel, width='stretch')
+            st.dataframe(sel_df, width='stretch', hide_index=True)
 
     with ttaut:
         st.markdown("#### Tautomer & Stereoisomer Explorer")
@@ -1055,7 +1055,7 @@ def page_single(p5, norm, mb, p6, p7):
                         taut_rows.append({"SMILES": tsmi[:40], "pKd": None, "Conf": None})
                     prog_t.progress((ti+1)/len(tauts))
                 tdf = pd.DataFrame(taut_rows).sort_values("pKd", ascending=False, na_position="last")
-                st.dataframe(tdf, use_container_width=True, hide_index=True)
+                st.dataframe(tdf, width='stretch', hide_index=True)
                 if len(tauts) > 1:
                     best_t = tdf.dropna(subset=["pKd"]).iloc[0]
                     orig_pkd = predict_p5(smiles, protein, p5, norm, mb)["pkd"]
@@ -1080,14 +1080,14 @@ def page_single(p5, norm, mb, p6, p7):
                         iso_rows.append({"SMILES": ismi[:40], "pKd": None, "Conf": None})
                     prog_s.progress((si+1)/len(isos))
                 idf = pd.DataFrame(iso_rows).sort_values("pKd", ascending=False, na_position="last")
-                st.dataframe(idf, use_container_width=True, hide_index=True)
+                st.dataframe(idf, width='stretch', hide_index=True)
                 if len(isos) > 1:
                     figs = px.bar(idf.dropna(subset=["pKd"]),
                                   x=[f"Iso {i+1}" for i in range(len(idf.dropna(subset=["pKd"])))],
                                   y="pKd", color="pKd", color_continuous_scale="RdYlGn",
                                   title="Stereoisomer pKd Ranking")
                     figs.update_layout(height=260, margin=dict(l=10,r=10,t=40,b=10))
-                    st.plotly_chart(figs, use_container_width=True)
+                    st.plotly_chart(figs, width='stretch')
         else:
             st.info("RDKit required.")
 
@@ -1118,7 +1118,7 @@ def page_single(p5, norm, mb, p6, p7):
                             pass
                         prog_l.progress((li+1)/len(analogues))
                     ldf = pd.DataFrame(rows).sort_values("Δ pKd", ascending=False)
-                    st.dataframe(ldf, use_container_width=True, hide_index=True)
+                    st.dataframe(ldf, width='stretch', hide_index=True)
                     better = ldf[ldf["Δ pKd"] > 0.05]
                     if not better.empty:
                         st.success(f"Found {len(better)} analogue(s) with improved affinity:")
@@ -1136,7 +1136,7 @@ def page_single(p5, norm, mb, p6, p7):
                     figl.update_layout(title="Δ pKd vs Parent Molecule",
                                        xaxis_tickangle=-35, height=360,
                                        margin=dict(l=10,r=10,t=50,b=80))
-                    st.plotly_chart(figl, use_container_width=True)
+                    st.plotly_chart(figl, width='stretch')
         else:
             st.info("RDKit required.")
 
@@ -1213,7 +1213,7 @@ def page_single(p5, norm, mb, p6, p7):
                                           annotation_text="Strong binder")
                         fig_mut.update_layout(height=320, yaxis_title="pKd",
                                               margin=dict(t=40,b=20))
-                        st.plotly_chart(fig_mut, use_container_width=True)
+                        st.plotly_chart(fig_mut, width='stretch')
                         st.caption(f"Mutation {wt_aa}{int(pos)}{new_aa}: "
                                    f"{'reduces' if delta_mut<0 else 'increases'} binding by "
                                    f"{abs(delta_mut):.3f} pKd units")
@@ -1261,12 +1261,12 @@ def page_batch(p5, norm, mb):
         if col not in df.columns:
             st.error(f"Missing column: `{col}`"); return
 
-    st.dataframe(df.head(5), use_container_width=True)
+    st.dataframe(df.head(5), width='stretch')
     c1,c2,c3 = st.columns(3)
     c1.metric("Rows",len(df)); c2.metric("Unique drugs",df["drug_smiles"].nunique())
     c3.metric("Unique proteins",df["protein_sequence"].nunique())
 
-    if not st.button("🚀 Run Predictions", use_container_width=True, type="primary"):
+    if not st.button("🚀 Run Predictions", width='stretch', type="primary"):
         return
 
     prog = st.progress(0); status = st.empty(); results = []
@@ -1293,20 +1293,24 @@ def page_batch(p5, norm, mb):
     s3.metric("Mean pKd",f"{valid['predicted_pKd'].mean():.3f}")
     s4.metric("Std pKd",f"{valid['predicted_pKd'].std():.3f}")
 
-    st.dataframe(rdf, use_container_width=True)
+    st.dataframe(rdf, width='stretch')
 
     col_csv, col_excel = st.columns(2)
     with col_csv:
         st.download_button("📥 Download CSV", rdf.to_csv(index=False),
-                           "batch_results.csv","text/csv", use_container_width=True)
+                           "batch_results.csv","text/csv", width='stretch')
     with col_excel:
-        buf = io.BytesIO()
-        with pd.ExcelWriter(buf, engine="openpyxl") as w:
-            rdf.to_excel(w, index=False, sheet_name="Predictions")
-        st.download_button("📥 Download Excel", buf.getvalue(),
-                           "batch_results.xlsx",
-                           "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                           use_container_width=True)
+        try:
+            import openpyxl  # noqa: F401
+            buf = io.BytesIO()
+            with pd.ExcelWriter(buf, engine="openpyxl") as w:
+                rdf.to_excel(w, index=False, sheet_name="Predictions")
+            st.download_button("📥 Download Excel", buf.getvalue(),
+                               "batch_results.xlsx",
+                               "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                               width='stretch')
+        except ImportError:
+            st.warning("Install openpyxl for Excel export: `pip install openpyxl`")
 
     if len(valid) > 1:
         st.markdown("#### Distribution")
@@ -1317,17 +1321,17 @@ def page_batch(p5, norm, mb):
                       annotation_text="Strong binder")
         fig.add_vline(x=5.0, line_dash="dot", line_color="orange",
                       annotation_text="Moderate")
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width='stretch')
 
         fig2 = px.scatter(valid, x="predicted_pKd", y="confidence",
                           color="predicted_pKd", color_continuous_scale="RdYlGn",
                           title="Confidence vs pKd")
-        st.plotly_chart(fig2, use_container_width=True)
+        st.plotly_chart(fig2, width='stretch')
 
         st.markdown("#### Top-5 Binders")
         st.dataframe(valid.nlargest(5,"predicted_pKd")[
             ["drug_smiles","predicted_pKd","confidence"]].reset_index(drop=True),
-            use_container_width=True, hide_index=True)
+            width='stretch', hide_index=True)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1351,7 +1355,7 @@ def page_comparison(p5, norm, mb):
             smiles_list.append(smi.strip().replace(" ",""))
             names_list.append(name)
 
-    if not st.button("🔮 Compare All", use_container_width=True, type="primary"):
+    if not st.button("🔮 Compare All", width='stretch', type="primary"):
         return
 
     results = []
@@ -1390,7 +1394,7 @@ def page_comparison(p5, norm, mb):
     st.success(f"🏆 Best binder: **{winner['Name']}** — pKd = **{winner['pKd']:.3f}**")
 
     st.dataframe(rdf[["Name","pKd","Confidence","MW","LogP","Binder"]],
-                 use_container_width=True)
+                 width='stretch')
 
     fig = go.Figure()
     colors = ["#2ecc71" if i==0 else "#3498db" for i in range(len(rdf))]
@@ -1401,7 +1405,7 @@ def page_comparison(p5, norm, mb):
     fig.add_hline(y=5.0, line_dash="dot",  line_color="orange", annotation_text="Moderate")
     fig.update_layout(title="Predicted Affinity Comparison", yaxis_title="pKd",
                       height=380, margin=dict(t=40,b=20))
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width='stretch')
 
     if RDKIT_AVAILABLE:
         st.markdown("#### Structures")
@@ -1428,7 +1432,7 @@ def page_interpretation(p5, norm, mb):
     with col2:
         protein = st.text_area("Protein Sequence", DEFAULT_PROT, height=80)
 
-    if not st.button("🔍 Analyse", use_container_width=True, type="primary"):
+    if not st.button("🔍 Analyse", width='stretch', type="primary"):
         return
 
     mol = Chem.MolFromSmiles(smiles) if RDKIT_AVAILABLE else None
@@ -1464,7 +1468,7 @@ def page_interpretation(p5, norm, mb):
                      title="Per-Atom Gradient Importance",
                      labels={"x":"Atom","y":"Importance"})
         fig.update_layout(height=240, margin=dict(l=10,r=10,t=40,b=10))
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width='stretch')
 
     with t_prot:
         seq_len = min(len(protein), 200)
@@ -1483,7 +1487,7 @@ def page_interpretation(p5, norm, mb):
         fig.update_layout(title=f"Protein Position Importance (first {seq_len} residues)",
                           xaxis_title="Position", yaxis_title="Importance",
                           height=300, margin=dict(l=10,r=10,t=40,b=10))
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width='stretch')
 
         top10 = np.argsort(pos_imp)[-10:][::-1]
         st.markdown("**Top-10 important residues:**")
@@ -1491,7 +1495,7 @@ def page_interpretation(p5, norm, mb):
             "Position": top10,
             "Residue": [protein[i] if i<len(protein) else "PAD" for i in top10],
             "Importance": pos_imp[top10].round(4),
-        }), hide_index=True, use_container_width=True)
+        }), hide_index=True, width='stretch')
 
     with t_feat:
         if RDKIT_AVAILABLE and mol:
@@ -1504,7 +1508,7 @@ def page_interpretation(p5, norm, mb):
                          title="Molecular Feature Attribution (normalised)",
                          labels={"x":"Feature","y":"Normalised contribution"})
             fig.update_layout(height=280, margin=dict(l=10,r=10,t=40,b=10))
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width='stretch')
             st.markdown("**Feature Explainability Summary**")
             contrib_df = pd.DataFrame({
                 "Feature": feats,
@@ -1512,7 +1516,7 @@ def page_interpretation(p5, norm, mb):
                 "Contribution": [round(v,3) for v in norm_v],
                 "Impact": ["+↑" if v > 0.5 else "~" for v in norm_v],
             })
-            st.dataframe(contrib_df, use_container_width=True, hide_index=True)
+            st.dataframe(contrib_df, width='stretch', hide_index=True)
 
     with t_attn:
         st.markdown("Cross-attention weights from fusion module — drug attending to protein.")
@@ -1545,7 +1549,7 @@ def page_interpretation(p5, norm, mb):
                 xaxis_title="Protein Position",
                 height=150, margin=dict(l=10,r=10,t=40,b=10),
                 yaxis=dict(showticklabels=False))
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width='stretch')
             # top attended residues
             top_att = np.argsort(aw)[-10:][::-1]
             st.markdown("**Top-10 attended residues (binding site candidates):**")
@@ -1553,7 +1557,7 @@ def page_interpretation(p5, norm, mb):
                 "Position": top_att,
                 "Residue":  [protein[i] if i<len(protein) else "PAD" for i in top_att],
                 "Attention": aw[top_att].round(4),
-            }), hide_index=True, use_container_width=True)
+            }), hide_index=True, width='stretch')
         else:
             st.info("Attention weights not available for this model configuration.")
 
@@ -1584,7 +1588,7 @@ def page_analytics():
                              mode="lines+markers",line=dict(color="red",width=2)))
     fig.update_layout(barmode="group", height=350, legend=dict(x=0.7,y=1),
                       yaxis_title="Score")
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width='stretch')
 
     st.markdown("---")
     preds = st.session_state.get("predictions",[])
@@ -1595,14 +1599,14 @@ def page_analytics():
         st.info("Run predictions to see analytics.")
     if preds:
         df = pd.DataFrame(preds)
-        st.dataframe(df, use_container_width=True, hide_index=True)
+        st.dataframe(df, width='stretch', hide_index=True)
         if len(df) > 1:
             fig2 = px.scatter(df, x=df.index, y="pKd", size="Confidence",
                               color="pKd", color_continuous_scale="RdYlGn",
                               title="Session pKd History")
             fig2.add_hline(y=7.0,line_dash="dash",line_color="red",annotation_text="Strong")
             fig2.update_layout(height=280)
-            st.plotly_chart(fig2, use_container_width=True)
+            st.plotly_chart(fig2, width='stretch')
         a1,a2,a3 = st.columns(3)
         a1.metric("Total predictions",len(df))
         a2.metric("Mean pKd",f"{df['pKd'].mean():.3f}")
@@ -1617,7 +1621,7 @@ def page_analytics():
         fig3.add_trace(go.Histogram(x=valid["confidence"],nbinsx=20,
                                     name="Conf",marker_color="#ff7f0e"),row=1,col=2)
         fig3.update_layout(height=300,showlegend=False)
-        st.plotly_chart(fig3, use_container_width=True)
+        st.plotly_chart(fig3, width='stretch')
 
         b1,b2,b3,b4 = st.columns(4)
         b1.metric("Total",len(valid))
@@ -1640,7 +1644,7 @@ def page_analytics():
                                  title="Your predictions vs DAVIS distribution",
                                  color="Percentile",color_continuous_scale="RdYlGn")
             fig_pct.update_layout(height=280)
-            st.plotly_chart(fig_pct,use_container_width=True)
+            st.plotly_chart(fig_pct,width='stretch')
         except Exception:
             pass
 
